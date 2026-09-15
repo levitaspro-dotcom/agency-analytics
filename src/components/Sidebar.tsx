@@ -39,9 +39,14 @@ export function Sidebar({ role, userName }: { role: string; userName: string }) 
           </>
         )}
         {role === 'SUPER_ADMIN' && (
-          <Link href="/settings" className={`nav-link ${pathname?.startsWith('/settings') ? 'active' : ''}`}>
-            Настройки
-          </Link>
+          <>
+            <Link href="/agency" className={`nav-link ${pathname?.startsWith('/agency') ? 'active' : ''}`}>
+              Агентство · все проекты
+            </Link>
+            <Link href="/settings" className={`nav-link ${pathname?.startsWith('/settings') ? 'active' : ''}`}>
+              Настройки
+            </Link>
+          </>
         )}
       </nav>
       <div style={{ marginTop: 'auto', paddingTop: 16, borderTop: '1px solid var(--border)', fontSize: 12.5 }}>
