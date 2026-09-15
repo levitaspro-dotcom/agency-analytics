@@ -1,0 +1,118 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  MANAGER
+  CLIENT
+}
+
+enum TransactionType {
+  REVENUE
+  OZON_FEE
+  COGS
+  EXTERNAL_EXPENSE
+  TAX
+}
+
+model User {
+  id           String              @id @default(cuid())
+  email        String              @unique
+  passwordHash String
+  name         String
+  role         UserRole
+  createdAt    DateTime            @default(now())
+  assignments  ProjectAssignment[]
+  activity     ActivityLog[]
+}
+
+model Client {
+  id        String    @id @default(cuid())
+  name      String
+  createdAt DateTime  @default(now())
+  projects  Project[]
+}
+
+model Project {
+  id           String                @id @default(cuid())
+  clientId     String
+  client       Client                @relation(fields: [clientId], references: [id])
+  name         String
+  createdAt    DateTime              @default(now())
+  stores       Store[]
+  products     Product[]
+  transactions FinanceTransaction[]
+  assignments  ProjectAssignment[]
+}
+
+model Store {
+  id           String                @id @default(cuid())
+  projectId    String
+  project      Project               @relation(fields: [projectId], references: [id])
+  name         String
+  ozonShopId   String?
+  createdAt    DateTime              @default(now())
+  products     Product[]
+  transactions FinanceTransaction[]
+}
+
+model ProjectAssignment {
+  id              String   @id @default(cuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id])
+  userId          String
+  user            User     @relation(fields: [userId], references: [id])
+  allowedSections String[] @default([])
+  createdAt       DateTime @default(now())
+
+  @@unique([projectId, userId])
+}
+
+model Product {
+  id           String                @id @default(cuid())
+  projectId    String
+  project      Project               @relation(fields: [projectId], references: [id])
+  storeId      String?
+  store        Store?                @relation(fields: [storeId], references: [id])
+  name         String
+  sku          String
+  sellPrice    Float
+  costPrice    Float
+  createdAt    DateTime              @default(now())
+  transactions FinanceTransaction[]
+}
+
+model FinanceTransaction {
+  id          String           @id @default(cuid())
+  projectId   String
+  project     Project          @relation(fields: [projectId], references: [id])
+  storeId     String?
+  store       Store?           @relation(fields: [storeId], references: [id])
+  productId   String?
+  product     Product?         @relation(fields: [productId], references: [id])
+  type        TransactionType
+  category    String
+  amount      Float
+  date        DateTime
+  description String?
+  createdAt   DateTime         @default(now())
+
+  @@index([projectId, date])
+}
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actor      User     @relation(fields: [actorId], references: [id])
+  action     String
+  targetType String
+  targetId   String?
+  meta       Json?
+  createdAt  DateTime @default(now())
+}
