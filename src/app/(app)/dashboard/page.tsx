@@ -2,7 +2,9 @@ import { redirect } from 'next/navigation';
 import { requireUser, listAccessibleProjects, assertProjectAccess, ForbiddenError } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
 import { computeFinanceSummary, computeAttention, type CategoryBreakdown } from '@/lib/finance';
+import { getProjectDataFreshness } from '@/lib/freshness';
 import { FilterBar } from '@/components/FilterBar';
+import { FreshnessBanner } from '@/components/FreshnessBanner';
 
 export const dynamic = 'force-dynamic';
 
@@ -54,14 +56,17 @@ export default async function DashboardPage({
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
 
-  const [summary, attention] = await Promise.all([
+  const [summary, attention, freshness] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
     computeAttention({ projectId, storeId, from, to }),
+    getProjectDataFreshness(projectId, storeId),
   ]);
 
   return (
     <div>
       <FilterBar basePath="/dashboard" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
+
+      <FreshnessBanner dataAsOf={freshness.dataAsOf} isStale={freshness.isStale} />
 
       <div className="kpi-grid">
         <div className="kpi-card">

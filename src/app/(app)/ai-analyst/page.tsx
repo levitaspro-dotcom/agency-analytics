@@ -4,6 +4,7 @@ import { requireUser, listAccessibleProjects, assertProjectAccess, ForbiddenErro
 import { resolvePeriod, inputDate } from '@/lib/period';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
+import { FreshnessBanner } from '@/components/FreshnessBanner';
 import { buildProjectAiContext } from '@/lib/ai/context';
 import { getActiveAiAdapter } from '@/lib/ai/config';
 import { ANALYST_SYSTEM_PROMPT, buildRecommendationPrompt, parseRecommendation } from '@/lib/ai/prompts';
@@ -183,18 +184,7 @@ export default async function AiAnalystPage({
         </div>
       )}
 
-      {ctx.isStale && (
-        <div className="attention-item warning" style={{ marginBottom: 20 }}>
-          <span className="attention-badge">Проверить</span>
-          <div>
-            <div className="attention-title">Данные могли устареть</div>
-            <div className="attention-detail">
-              Последнее обновление: {ctx.dataAsOf ? ctx.dataAsOf.toLocaleString('ru-RU') : 'данных ещё не было'}. Зайдите в «Проекты» →
-              «Магазины Ozon» и нажмите «Синхронизировать», прежде чем доверять выводам ИИ.
-            </div>
-          </div>
-        </div>
-      )}
+      <FreshnessBanner dataAsOf={ctx.dataAsOf} isStale={ctx.isStale} />
 
       <div className="panel">
         <h2>Спросить ИИ-аналитика</h2>

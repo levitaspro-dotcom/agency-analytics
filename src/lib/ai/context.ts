@@ -1,8 +1,6 @@
-import { prisma } from '../prisma';
 import { computeFinanceSummary, computeProductInsights, computeAttention } from '../finance';
 import { previousPeriod, formatDate } from '../period';
-
-const STALE_AFTER_HOURS = 72;
+import { getProjectDataFreshness } from '../freshness';
 
 export interface ProjectAiContext {
   /** Текст, который передаётся модели как контекст. Содержит только агрегированные
@@ -27,18 +25,14 @@ export async function buildProjectAiContext(params: {
   const { projectId, storeId, from, to } = params;
   const prev = previousPeriod(from, to);
 
-  const [summary, prevSummary, products, attention, lastTx, lastSync] = await Promise.all([
+  const [summary, prevSummary, products, attention, freshness] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
     computeFinanceSummary({ projectId, storeId, from: prev.from, to: prev.to }),
     computeProductInsights({ projectId, storeId, from, to }),
     computeAttention({ projectId, storeId, from, to }),
-    prisma.financeTransaction.findFirst({ where: { projectId, ...(storeId ? { storeId } : {}) }, orderBy: { date: 'desc' }, select: { date: true } }),
-    prisma.store.findFirst({ where: { projectId, lastSyncAt: { not: null } }, orderBy: { lastSyncAt: 'desc' }, select: { lastSyncAt: true } }),
+    getProjectDataFreshness(projectId, storeId),
   ]);
-
-  const candidates = [lastTx?.date, lastSync?.lastSyncAt].filter((d): d is Date => !!d);
-  const dataAsOf = candidates.length ? new Date(Math.max(...candidates.map((d) => d.getTime()))) : null;
-  const isStale = !dataAsOf || (Date.now() - dataAsOf.getTime()) / 3600000 > STALE_AFTER_HOURS;
+  const { dataAsOf, isStale } = freshness;
 
   const lines: string[] = [];
   lines.push(`Период анализа: ${formatDate(from)} – ${formatDate(to)}.`);
