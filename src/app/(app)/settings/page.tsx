@@ -11,7 +11,7 @@ export const dynamic = 'force-dynamic';
 const ROLE_LABEL: Record<string, string> = {
   SUPER_ADMIN: 'Главный администратор',
   MANAGER: 'Менеджер',
-  CLIENT: 'Клиент',
+  CLIENT: 'Продавец',
 };
 
 const AI_PROVIDER_LABEL: Record<string, string> = {
@@ -236,7 +236,7 @@ export default async function SettingsPage() {
           <input type="password" name="password" placeholder="Пароль (мин. 8 символов)" required minLength={8} />
           <select name="role" defaultValue="MANAGER">
             <option value="MANAGER">Менеджер</option>
-            <option value="CLIENT">Клиент</option>
+            <option value="CLIENT">Продавец</option>
             <option value="SUPER_ADMIN">Главный администратор</option>
           </select>
           <button className="btn btn-primary" type="submit">

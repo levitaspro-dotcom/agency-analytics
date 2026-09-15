@@ -55,6 +55,99 @@ async function updateProjectTaxRateAction(formData: FormData) {
   revalidatePath('/reports');
 }
 
+async function renameClientAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const clientId = String(formData.get('clientId') || '');
+  const name = String(formData.get('name') || '').trim();
+  if (!clientId || !name) return;
+  await prisma.client.update({ where: { id: clientId }, data: { name } });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'client.rename', targetType: 'Client', targetId: clientId, meta: { name } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/agency');
+}
+
+async function deleteClientAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const clientId = String(formData.get('clientId') || '');
+  if (!clientId) return;
+  const client = await prisma.client.findUniqueOrThrow({ where: { id: clientId } });
+  const projects = await prisma.project.findMany({ where: { clientId }, select: { id: true } });
+  const projectIds = projects.map((p) => p.id);
+
+  // Удаление продавца необратимо и удаляет вместе с ним все его проекты и всё, что было
+  // загружено по ним (магазины, товары, финансовые операции) — как и при удалении
+  // отдельного проекта или магазина, чтобы не оставалось «осиротевших» данных.
+  await prisma.$transaction([
+    prisma.financeTransaction.deleteMany({ where: { projectId: { in: projectIds } } }),
+    prisma.product.deleteMany({ where: { projectId: { in: projectIds } } }),
+    prisma.store.deleteMany({ where: { projectId: { in: projectIds } } }),
+    prisma.project.deleteMany({ where: { clientId } }),
+    prisma.client.delete({ where: { id: clientId } }),
+  ]);
+
+  await prisma.activityLog.create({
+    data: {
+      actorId: user.id,
+      actorName: user.name,
+      action: 'client.delete',
+      targetType: 'Client',
+      targetId: clientId,
+      meta: { name: client.name, projectsDeleted: projectIds.length },
+    },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/agency');
+  revalidatePath('/dashboard');
+}
+
+async function renameProjectAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  const name = String(formData.get('name') || '').trim();
+  if (!projectId || !name) return;
+  await prisma.project.update({ where: { id: projectId }, data: { name } });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'project.rename', targetType: 'Project', targetId: projectId, meta: { name } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/agency');
+}
+
+async function deleteProjectAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  if (!projectId) return;
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
+
+  // Как и удаление магазина/продавца — необратимо: вместе с проектом удаляются все его
+  // магазины, товары и финансовые операции, чтобы не оставалось «осиротевших» данных.
+  // Назначения пользователей, сообщения ИИ-аналитика и рекомендации по проекту удаляются
+  // автоматически на уровне базы (каскад по внешнему ключу).
+  await prisma.$transaction([
+    prisma.financeTransaction.deleteMany({ where: { projectId } }),
+    prisma.product.deleteMany({ where: { projectId } }),
+    prisma.store.deleteMany({ where: { projectId } }),
+    prisma.project.delete({ where: { id: projectId } }),
+  ]);
+
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'project.delete', targetType: 'Project', targetId: projectId, meta: { name: project.name } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/agency');
+  revalidatePath('/dashboard');
+}
+
 async function assignUserAction(formData: FormData) {
   'use server';
   const user = await requireUser();
@@ -466,11 +559,36 @@ export default async function ProjectsPage() {
   return (
     <div>
       <div className="panel">
-        <h2>Клиенты и проекты</h2>
+        <h2>Продавцы и проекты</h2>
         {visibleClients.length === 0 && <div className="empty-state">Проектов пока нет.</div>}
         {visibleClients.map((client) => (
           <div key={client.id} style={{ marginBottom: 20 }}>
-            <h3>{client.name}</h3>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
+              {isAdmin ? (
+                <form action={renameClientAction} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <input type="hidden" name="clientId" value={client.id} />
+                  <input
+                    type="text"
+                    name="name"
+                    defaultValue={client.name}
+                    style={{ fontSize: 15, fontWeight: 600, padding: '3px 6px', width: 200 }}
+                  />
+                  <button className="btn" style={{ padding: '3px 8px', fontSize: 12 }} type="submit">
+                    ✓
+                  </button>
+                </form>
+              ) : (
+                <h3 style={{ margin: 0 }}>{client.name}</h3>
+              )}
+              {isAdmin && (
+                <form action={deleteClientAction}>
+                  <input type="hidden" name="clientId" value={client.id} />
+                  <button className="btn btn-danger" style={{ padding: '3px 8px', fontSize: 12 }} type="submit">
+                    Удалить продавца
+                  </button>
+                </form>
+              )}
+            </div>
             <table className="data-table">
               <thead>
                 <tr>
@@ -481,6 +599,7 @@ export default async function ProjectsPage() {
                   </th>
                   <th>Команда</th>
                   {isAdmin && <th>Назначить</th>}
+                  {isAdmin && <th>Действия</th>}
                 </tr>
               </thead>
               <tbody>
@@ -509,7 +628,7 @@ export default async function ProjectsPage() {
                         : p.assignments.map((a) => (
                             <div key={a.id} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 2 }}>
                               <span>
-                                {a.user.name} ({a.user.role === 'MANAGER' ? 'менеджер' : 'клиент'})
+                                {a.user.name} ({a.user.role === 'MANAGER' ? 'менеджер' : 'продавец'})
                               </span>
                               {isAdmin && (
                                 <form action={removeAssignmentAction}>
@@ -537,6 +656,28 @@ export default async function ProjectsPage() {
                           </select>
                           <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }}>
                             Назначить
+                          </button>
+                        </form>
+                      </td>
+                    )}
+                    {isAdmin && (
+                      <td>
+                        <form action={renameProjectAction} style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                          <input type="hidden" name="projectId" value={p.id} />
+                          <input
+                            type="text"
+                            name="name"
+                            defaultValue={p.name}
+                            style={{ width: 110, padding: '4px 6px', fontSize: 12.5 }}
+                          />
+                          <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            ✓
+                          </button>
+                        </form>
+                        <form action={deleteProjectAction}>
+                          <input type="hidden" name="projectId" value={p.id} />
+                          <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            Удалить
                           </button>
                         </form>
                       </td>
@@ -662,9 +803,9 @@ export default async function ProjectsPage() {
 
       {isAdmin && (
         <div className="panel">
-          <h2>Добавить клиента</h2>
+          <h2>Добавить продавца</h2>
           <form action={createClientAction} style={{ display: 'flex', gap: 8 }}>
-            <input type="text" name="name" placeholder="Название клиента" required style={{ flex: 1 }} />
+            <input type="text" name="name" placeholder="Название продавца" required style={{ flex: 1 }} />
             <button className="btn btn-primary" type="submit">
               Создать
             </button>

@@ -63,7 +63,7 @@ export default async function AgencyOverviewPage({
       </form>
 
       <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -14, marginBottom: 20 }}>
-        Сводка по всем клиентам и проектам агентства за {formatDate(from)} – {formatDate(to)}. Как главный
+        Сводка по всем продавцам и проектам агентства за {formatDate(from)} – {formatDate(to)}. Как главный
         администратор вы видите здесь все текущие и будущие проекты автоматически — без ручного назначения.
       </p>
 
@@ -103,7 +103,7 @@ export default async function AgencyOverviewPage({
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Клиент</th>
+                  <th>Продавец</th>
                   <th>Проект</th>
                   <th>Выручка</th>
                   <th>Расходы</th>

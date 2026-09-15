@@ -15,7 +15,7 @@ const NAV = [
 const ROLE_LABEL: Record<string, string> = {
   SUPER_ADMIN: 'Главный администратор',
   MANAGER: 'Менеджер',
-  CLIENT: 'Клиент',
+  CLIENT: 'Продавец',
 };
 
 export function Sidebar({ role, userName }: { role: string; userName: string }) {

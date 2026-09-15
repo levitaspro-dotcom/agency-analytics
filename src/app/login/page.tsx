@@ -45,7 +45,7 @@ export default function LoginPage() {
           <br />
           Менеджер: <code>manager@levitaspro.ru</code>
           <br />
-          Клиент: <code>client@romashka.ru</code>
+          Продавец: <code>client@romashka.ru</code>
           <br />
           Пароль для всех: <code>Demo12345!</code>
         </div>
