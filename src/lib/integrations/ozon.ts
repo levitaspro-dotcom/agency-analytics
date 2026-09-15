@@ -80,25 +80,80 @@ export interface OzonSyncResult {
   operations: OzonOperation[];
 }
 
+/** Разбивает массив на батчи фиксированного размера (Ozon принимает не больше 200 posting_numbers за один запрос). */
+function chunkArray<T>(arr: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 /**
- * Разбивает период на куски по календарным месяцам — новый метод Ozon
- * (см. ниже) принимает диапазон не длиннее одного месяца за запрос.
+ * Собирает номера отправлений (posting_number) за период через два стабильных,
+ * давно не менявшихся метода Ozon — отдельно FBS и FBO (у аккаунта может быть
+ * задействована любая из схем или обе сразу).
  */
-function monthChunks(dateFrom: Date, dateTo: Date): { from: Date; to: Date }[] {
-  const chunks: { from: Date; to: Date }[] = [];
-  let cursor = new Date(dateFrom.getTime());
-  while (cursor < dateTo) {
-    const nextMonthStart = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
-    const chunkEnd = nextMonthStart < dateTo ? nextMonthStart : dateTo;
-    chunks.push({ from: cursor, to: chunkEnd });
-    cursor = nextMonthStart;
+async function fetchPostingNumbers(creds: OzonCredentials, dateFrom: Date, dateTo: Date): Promise<{ postingNumbers: string[]; errors: string[] }> {
+  const postingNumbers = new Set<string>();
+  const errors: string[] = [];
+
+  // FBS: POST /v3/posting/fbs/list — пагинация limit/offset, лимит страницы до 50, признак конца — has_next.
+  {
+    let offset = 0;
+    const limit = 50;
+    for (let guard = 0; guard < 200; guard++) {
+      const { ok, status, json } = await ozonFetch(creds, '/v3/posting/fbs/list', {
+        dir: 'ASC',
+        filter: { since: dateFrom.toISOString(), to: dateTo.toISOString() },
+        limit,
+        offset,
+      });
+      if (!ok) {
+        errors.push(`FBS: ${ozonErrorMessage(status, json)}`);
+        break;
+      }
+      const postings: any[] = json?.result?.postings ?? [];
+      for (const p of postings) if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+      if (!json?.result?.has_next || postings.length === 0) break;
+      offset += limit;
+    }
   }
-  return chunks;
+
+  // FBO: POST /v2/posting/fbo/list — пагинация limit/offset, лимит страницы до 1000, признак конца — неполная страница.
+  {
+    let offset = 0;
+    const limit = 1000;
+    for (let guard = 0; guard < 50; guard++) {
+      const { ok, status, json } = await ozonFetch(creds, '/v2/posting/fbo/list', {
+        dir: 'ASC',
+        filter: { since: dateFrom.toISOString(), to: dateTo.toISOString() },
+        limit,
+        offset,
+      });
+      if (!ok) {
+        errors.push(`FBO: ${ozonErrorMessage(status, json)}`);
+        break;
+      }
+      const postings: any[] = json?.result ?? [];
+      for (const p of postings) if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+      if (postings.length < limit) break;
+      offset += limit;
+    }
+  }
+
+  return { postingNumbers: [...postingNumbers], errors };
 }
 
 /** Ищет массив операций в ответе — формат ответа у нового метода не задокументирован публично на 100%, поэтому проверяем несколько вероятных мест. */
 function extractOperationsArray(json: any): any[] | null {
-  const candidates = [json?.result?.operations, json?.result?.postings, json?.result?.items, json?.postings, json?.operations, json?.items];
+  const candidates = [
+    json?.result,
+    json?.result?.operations,
+    json?.result?.postings,
+    json?.result?.items,
+    json?.postings,
+    json?.operations,
+    json?.items,
+  ];
   for (const c of candidates) {
     if (Array.isArray(c)) return c;
   }
@@ -134,11 +189,16 @@ function normalizeOperation(raw: any): OzonOperation | null {
  * за период. Себестоимость и налоги Ozon не знает — они остаются на стороне приложения.
  *
  * Метод /v3/finance/transaction/list, которым мы пользовались раньше, Ozon отключил
- * (возвращает "obsolete method cannot be used"). Используем актуальный на его замену —
- * /v1/finance/accrual/postings. Разбор ответа сделан защитно: если формат ответа не
- * совпадёт с ожидаемым — синхронизация не притворится «успешной с нулём операций»,
- * а вернёт ok:false с диагностикой реальной структуры ответа, чтобы это было видно
- * в интерфейсе и можно было быстро донастроить сопоставление полей.
+ * (возвращает "obsolete method cannot be used"). Его замена — /v1/finance/accrual/postings —
+ * устроена иначе: принимает не диапазон дат, а конкретный список номеров отправлений
+ * (posting_numbers, не больше 200 за раз). Поэтому сначала собираем номера отправлений
+ * за период через стабильные методы списков FBS/FBO, а затем батчами запрашиваем по
+ * ним начисления.
+ *
+ * Разбор ответа сделан защитно: если формат ответа не совпадёт с ожидаемым — синхронизация
+ * не притворится «успешной с нулём операций», а вернёт ok:false с диагностикой реальной
+ * структуры ответа, чтобы это было видно в интерфейсе и можно было быстро донастроить
+ * сопоставление полей.
  */
 export async function fetchOzonFinanceTransactions(
   creds: OzonCredentials,
@@ -146,42 +206,59 @@ export async function fetchOzonFinanceTransactions(
   dateTo: Date,
 ): Promise<OzonSyncResult> {
   const operations: OzonOperation[] = [];
-  const pageSize = 1000;
-  const maxPages = 20; // защита от бесконечной пагинации на очень крупных кабинетах
-  let unrecognizedSample: string | null = null;
 
-  for (const chunk of monthChunks(dateFrom, dateTo)) {
-    let page = 1;
-    while (page <= maxPages) {
-      const { ok, status, json } = await ozonFetch(creds, '/v1/finance/accrual/postings', {
-        filter: { date: { from: chunk.from.toISOString(), to: chunk.to.toISOString() } },
-        page,
-        page_size: pageSize,
-      });
-      if (!ok) {
-        return { ok: false, message: ozonErrorMessage(status, json), operations };
-      }
-      const rawList = extractOperationsArray(json);
-      if (rawList === null) {
-        if (!unrecognizedSample) unrecognizedSample = shortJsonPreview(json);
-        break;
-      }
-      for (const raw of rawList) {
-        const normalized = normalizeOperation(raw);
-        if (normalized) operations.push(normalized);
-      }
-      if (rawList.length < pageSize) break;
-      page += 1;
+  const { postingNumbers, errors: postingErrors } = await fetchPostingNumbers(creds, dateFrom, dateTo);
+  if (postingNumbers.length === 0) {
+    if (postingErrors.length > 0) {
+      return { ok: false, message: `Не удалось получить список отправлений: ${postingErrors.join('; ')}`, operations };
     }
+    return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations };
+  }
+
+  let unrecognizedSample: string | null = null;
+  let rawItemsSeen = 0;
+
+  for (const batch of chunkArray(postingNumbers, 200)) {
+    const { ok, status, json } = await ozonFetch(creds, '/v1/finance/accrual/postings', {
+      posting_numbers: batch,
+    });
+    if (!ok) {
+      return { ok: false, message: ozonErrorMessage(status, json), operations };
+    }
+    const rawList = extractOperationsArray(json);
+    if (rawList === null) {
+      if (!unrecognizedSample) unrecognizedSample = shortJsonPreview(json);
+      continue;
+    }
+    rawItemsSeen += rawList.length;
+    for (const raw of rawList) {
+      const normalized = normalizeOperation(raw);
+      if (normalized) operations.push(normalized);
+      else if (!unrecognizedSample && raw && typeof raw === 'object') {
+        // Нашли массив, но не смогли распознать в его элементах ни одной операции —
+        // вероятно, элементы вложенные (например, начисления сгруппированы по
+        // отправлению), а не плоский список операций. Не подставляем тихо 0 — фиксируем пример.
+        unrecognizedSample = shortJsonPreview({ note: 'элемент массива не распознан как операция', item: raw });
+      }
+    }
+  }
+
+  if (rawItemsSeen > 0 && operations.length === 0 && unrecognizedSample) {
+    return {
+      ok: false,
+      message: `Ozon вернул данные (${rawItemsSeen} элементов), но их формат не распознан — нужна донастройка интеграции. Отправлений найдено: ${postingNumbers.length}. Пример элемента: ${unrecognizedSample}`,
+      operations,
+    };
   }
 
   if (unrecognizedSample) {
     return {
       ok: false,
-      message: `Ozon вернул ответ в незнакомом формате — нужна донастройка интеграции. Структура ответа: ${unrecognizedSample}`,
+      message: `Ozon вернул ответ в незнакомом формате — нужна донастройка интеграции. Отправлений найдено: ${postingNumbers.length}. Структура ответа: ${unrecognizedSample}`,
       operations,
     };
   }
 
-  return { ok: true, message: `Загружено операций: ${operations.length}`, operations };
+  const notePosting = postingErrors.length > 0 ? ` (не удалось проверить часть отправлений: ${postingErrors.join('; ')})` : '';
+  return { ok: true, message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}`, operations };
 }
