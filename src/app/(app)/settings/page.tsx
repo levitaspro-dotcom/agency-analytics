@@ -24,9 +24,50 @@ async function createUserAction(formData: FormData) {
   const passwordHash = await bcrypt.hash(password, 10);
   await prisma.user.create({ data: { email, name, role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT', passwordHash } });
   await prisma.activityLog.create({
-    data: { actorId: admin.id, action: 'user.create', targetType: 'User', targetId: email, meta: { role } },
+    data: { actorId: admin.id, actorName: admin.name, action: 'user.create', targetType: 'User', targetId: email, meta: { role, name } },
   });
   revalidatePath('/settings');
+}
+
+async function deleteUserAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const userId = String(formData.get('userId') || '');
+  if (!userId) return;
+
+  if (userId === admin.id) {
+    throw new Error('Нельзя удалить свою же учётную запись.');
+  }
+
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+
+  if (target.role === 'SUPER_ADMIN') {
+    const adminsLeft = await prisma.user.count({ where: { role: 'SUPER_ADMIN' } });
+    if (adminsLeft <= 1) {
+      throw new Error('Нельзя удалить последнего главного администратора.');
+    }
+  }
+
+  // Назначения на проекты удаляются вместе с пользователем; записи в истории действий,
+  // где он был исполнителем, остаются (с сохранённым именем), но отвязываются от аккаунта.
+  await prisma.$transaction([
+    prisma.projectAssignment.deleteMany({ where: { userId } }),
+    prisma.user.delete({ where: { id: userId } }),
+  ]);
+
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.delete',
+      targetType: 'User',
+      targetId: userId,
+      meta: { email: target.email, name: target.name, role: target.role },
+    },
+  });
+  revalidatePath('/settings');
+  revalidatePath('/projects');
 }
 
 export default async function SettingsPage() {
@@ -65,6 +106,7 @@ export default async function SettingsPage() {
               <th>Email</th>
               <th>Роль</th>
               <th>Создан</th>
+              <th></th>
             </tr>
           </thead>
           <tbody>
@@ -74,10 +116,26 @@ export default async function SettingsPage() {
                 <td>{u.email}</td>
                 <td>{ROLE_LABEL[u.role] ?? u.role}</td>
                 <td>{u.createdAt.toLocaleDateString('ru-RU')}</td>
+                <td>
+                  {u.id === user.id ? (
+                    <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>это вы</span>
+                  ) : (
+                    <form action={deleteUserAction}>
+                      <input type="hidden" name="userId" value={u.id} />
+                      <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                        Удалить
+                      </button>
+                    </form>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: 10 }}>
+          Удаление отзывает у пользователя все назначения на проекты и вход в систему; последнего главного
+          администратора удалить нельзя.
+        </p>
 
         <h3>Добавить пользователя</h3>
         <form action={createUserAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -112,7 +170,7 @@ export default async function SettingsPage() {
               {activity.map((a) => (
                 <tr key={a.id}>
                   <td>{a.createdAt.toLocaleString('ru-RU')}</td>
-                  <td>{a.actor.name}</td>
+                  <td>{a.actorName ?? a.actor?.name ?? 'Удалённый пользователь'}</td>
                   <td>{a.action}</td>
                 </tr>
               ))}

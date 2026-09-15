@@ -15,7 +15,7 @@ async function createClientAction(formData: FormData) {
   if (!name) return;
   const client = await prisma.client.create({ data: { name } });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'client.create', targetType: 'Client', targetId: client.id, meta: { name } },
+    data: { actorId: user.id, actorName: user.name, action: 'client.create', targetType: 'Client', targetId: client.id, meta: { name } },
   });
   revalidatePath('/projects');
 }
@@ -29,7 +29,7 @@ async function createProjectAction(formData: FormData) {
   if (!clientId || !name) return;
   const project = await prisma.project.create({ data: { clientId, name } });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'project.create', targetType: 'Project', targetId: project.id, meta: { name } },
+    data: { actorId: user.id, actorName: user.name, action: 'project.create', targetType: 'Project', targetId: project.id, meta: { name } },
   });
   revalidatePath('/projects');
 }
@@ -47,7 +47,7 @@ async function assignUserAction(formData: FormData) {
     create: { projectId, userId },
   });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'assignment.create', targetType: 'Project', targetId: projectId, meta: { userId } },
+    data: { actorId: user.id, actorName: user.name, action: 'assignment.create', targetType: 'Project', targetId: projectId, meta: { userId } },
   });
   revalidatePath('/projects');
 }
@@ -60,7 +60,7 @@ async function removeAssignmentAction(formData: FormData) {
   if (!id) return;
   const a = await prisma.projectAssignment.delete({ where: { id } });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'assignment.remove', targetType: 'Project', targetId: a.projectId, meta: { userId: a.userId } },
+    data: { actorId: user.id, actorName: user.name, action: 'assignment.remove', targetType: 'Project', targetId: a.projectId, meta: { userId: a.userId } },
   });
   revalidatePath('/projects');
 }
@@ -86,7 +86,7 @@ async function addStoreAction(formData: FormData) {
     },
   });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'store.create', targetType: 'Store', targetId: store.id, meta: { name, projectId } },
+    data: { actorId: user.id, actorName: user.name, action: 'store.create', targetType: 'Store', targetId: store.id, meta: { name, projectId } },
   });
   revalidatePath('/projects');
 }
@@ -116,7 +116,7 @@ async function testStoreConnectionAction(formData: FormData) {
     data: { lastTestAt: new Date(), lastTestOk: result.ok, lastTestMessage: result.message },
   });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'store.testConnection', targetType: 'Store', targetId: storeId, meta: result },
+    data: { actorId: user.id, actorName: user.name, action: 'store.testConnection', targetType: 'Store', targetId: storeId, meta: result },
   });
   revalidatePath('/projects');
 }
@@ -232,11 +232,38 @@ async function syncStoreAction(formData: FormData) {
     },
   });
   await prisma.activityLog.create({
-    data: { actorId: user.id, action: 'store.sync', targetType: 'Store', targetId: storeId, meta: { ok: syncResult.ok, imported, days } },
+    data: { actorId: user.id, actorName: user.name, action: 'store.sync', targetType: 'Store', targetId: storeId, meta: { ok: syncResult.ok, imported, days } },
   });
   revalidatePath('/projects');
   revalidatePath('/dashboard');
   revalidatePath('/expenses');
+}
+
+async function deleteStoreAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const storeId = String(formData.get('storeId') || '');
+  if (!storeId) return;
+  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
+  await assertProjectAccess(user, store.projectId);
+
+  // Магазин удаляется вместе со всеми данными, которые были привязаны именно к нему
+  // (импортированные из Ozon финансовые операции и карточки товаров этого магазина),
+  // чтобы после удаления в дашборде не осталось «осиротевших» цифр.
+  await prisma.$transaction([
+    prisma.financeTransaction.deleteMany({ where: { storeId } }),
+    prisma.product.deleteMany({ where: { storeId } }),
+    prisma.store.delete({ where: { id: storeId } }),
+  ]);
+
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'store.delete', targetType: 'Store', targetId: storeId, meta: { name: store.name, projectId: store.projectId } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/dashboard');
+  revalidatePath('/expenses');
+  revalidatePath('/products');
 }
 
 export default async function ProjectsPage() {
@@ -330,7 +357,8 @@ export default async function ProjectsPage() {
         <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
           Client-Id и Api-Key берутся в личном кабинете Ozon Seller: Настройки → Seller API. Ключ хранится на
           сервере в зашифрованном виде и повторно нигде не показывается — только последние 4 символа, чтобы
-          понять, какой ключ сохранён.
+          понять, какой ключ сохранён. Удаление магазина необратимо и удаляет вместе с ним все загруженные из
+          Ozon финансовые операции и товары этого магазина.
         </p>
 
         {visibleClients.flatMap((c) => c.projects).every((p) => p.stores.length === 0) && (
@@ -353,6 +381,7 @@ export default async function ProjectsPage() {
                       <th>Api-Key</th>
                       <th>Проверка подключения</th>
                       <th>Синхронизация за 30 дней</th>
+                      <th></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -395,6 +424,14 @@ export default async function ProjectsPage() {
                             <input type="hidden" name="days" value={30} />
                             <button className="btn btn-primary" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
                               Синхронизировать
+                            </button>
+                          </form>
+                        </td>
+                        <td>
+                          <form action={deleteStoreAction}>
+                            <input type="hidden" name="storeId" value={s.id} />
+                            <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                              Удалить
                             </button>
                           </form>
                         </td>
