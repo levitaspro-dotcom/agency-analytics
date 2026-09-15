@@ -72,6 +72,8 @@ export interface OzonOperation {
   accruals_for_sale: number;
   amount: number;
   sale_commission?: number;
+  /** Ozon SKU товара, к которому относится эта строка начисления (если есть) — используется для привязки операции к карточке товара. */
+  sku?: string;
 }
 
 export interface OzonSyncResult {
@@ -236,6 +238,7 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
         operation_date,
         accruals_for_sale: amount > 0 ? amount : 0,
         amount,
+        sku: a.sku !== undefined && a.sku !== null ? String(a.sku) : undefined,
       });
     }
   }
@@ -318,4 +321,102 @@ export async function fetchOzonFinanceTransactions(
     message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}`,
     operations,
   };
+}
+
+export interface OzonProduct {
+  /** Числовой SKU Ozon — по нему сопоставляем товар с финансовыми операциями (accrual-строки несут именно его). */
+  sku: string;
+  offerId: string;
+  name: string;
+  sellPrice: number;
+}
+
+export interface OzonProductsResult {
+  ok: boolean;
+  message: string;
+  products: OzonProduct[];
+}
+
+/**
+ * Забирает каталог товаров магазина: артикул (offer_id), Ozon SKU, название и текущую
+ * цену продажи. Себестоимость Ozon не знает в принципе — это поле в приложении всегда
+ * заполняется вручную и синхронизацией никогда не перезаписывается.
+ *
+ * В отличие от финансового API, методы списка товаров (/v3/product/list) и цен
+ * (/v5/product/info/prices) стабильные и давно не менялись, поэтому здесь меньше
+ * неопределённости, чем в начислениях. Название товара — необязательный бонус:
+ * если его не удалось получить, используем артикул как отображаемое имя, это не
+ * влияет на суммы.
+ */
+export async function fetchOzonProducts(creds: OzonCredentials): Promise<OzonProductsResult> {
+  const items: { productId: string; offerId: string }[] = [];
+  {
+    let lastId = '';
+    for (let guard = 0; guard < 100; guard++) {
+      const { ok, status, json } = await ozonFetch(creds, '/v3/product/list', {
+        filter: {},
+        last_id: lastId,
+        limit: 1000,
+      });
+      if (!ok) return { ok: false, message: ozonErrorMessage(status, json), products: [] };
+      const list: any[] = json?.result?.items ?? [];
+      for (const it of list) {
+        if (it?.offer_id !== undefined) items.push({ productId: String(it.product_id ?? ''), offerId: String(it.offer_id) });
+      }
+      const nextLastId = json?.result?.last_id;
+      if (!nextLastId || list.length === 0) break;
+      lastId = nextLastId;
+    }
+  }
+
+  if (items.length === 0) {
+    return { ok: true, message: 'В магазине пока нет товаров на Ozon.', products: [] };
+  }
+
+  const priceByOfferId = new Map<string, { sku: string; sellPrice: number }>();
+  for (const batch of chunkArray(items.map((i) => i.offerId), 1000)) {
+    let cursor = '';
+    for (let guard = 0; guard < 20; guard++) {
+      const { ok, status, json } = await ozonFetch(creds, '/v5/product/info/prices', {
+        filter: { offer_id: batch },
+        cursor,
+        limit: 1000,
+      });
+      if (!ok) return { ok: false, message: ozonErrorMessage(status, json), products: [] };
+      const list: any[] = json?.items ?? json?.result?.items ?? [];
+      for (const it of list) {
+        const offerId = it?.offer_id !== undefined ? String(it.offer_id) : undefined;
+        const sku = it?.sku !== undefined && it?.sku !== null ? String(it.sku) : offerId;
+        const sellPrice = Number(it?.price?.price ?? it?.price ?? 0) || 0;
+        if (offerId) priceByOfferId.set(offerId, { sku: sku ?? offerId, sellPrice });
+      }
+      const nextCursor = json?.cursor ?? json?.result?.cursor;
+      if (!nextCursor || list.length === 0) break;
+      cursor = nextCursor;
+    }
+  }
+
+  const nameByOfferId = new Map<string, string>();
+  for (const batch of chunkArray(items.map((i) => i.productId).filter(Boolean), 1000)) {
+    const { ok, json } = await ozonFetch(creds, '/v3/product/info/list', { product_id: batch });
+    if (!ok) continue; // название — не критично для денег, при неудаче остаётся артикул
+    const list: any[] = json?.result?.items ?? json?.items ?? [];
+    for (const it of list) {
+      const offerId = it?.offer_id !== undefined ? String(it.offer_id) : undefined;
+      const name = it?.name;
+      if (offerId && name) nameByOfferId.set(offerId, String(name));
+    }
+  }
+
+  const products: OzonProduct[] = items.map((it) => {
+    const priceInfo = priceByOfferId.get(it.offerId);
+    return {
+      sku: priceInfo?.sku ?? it.offerId,
+      offerId: it.offerId,
+      name: nameByOfferId.get(it.offerId) ?? it.offerId,
+      sellPrice: priceInfo?.sellPrice ?? 0,
+    };
+  });
+
+  return { ok: true, message: `Товаров получено: ${products.length}`, products };
 }

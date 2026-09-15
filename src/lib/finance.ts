@@ -75,7 +75,8 @@ export interface ProductInsight {
   sku: string;
   revenue: number;
   cogsFromTx: number;
-  unitMargin: number;
+  /** null, если себестоимость ещё не введена — тогда маржу с единицы посчитать честно нельзя (не показываем в этом случае мнимые 100%). */
+  unitMargin: number | null;
   periodProfit: number;
   flag: 'critical' | 'warning' | null;
   reason?: string;
@@ -110,14 +111,20 @@ export async function computeProductInsights(params: {
     .map((p) => {
       const revenue = revByProduct.get(p.id) ?? 0;
       const cogsFromTx = cogsByProduct.get(p.id) ?? 0;
-      const unitMargin = p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : 0;
+      const costKnown = p.costPrice > 0;
+      const unitMargin = costKnown && p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : null;
       const periodProfit = revenue - cogsFromTx;
       let flag: 'critical' | 'warning' | null = null;
       let reason: string | undefined;
-      if (revenue > 0 && periodProfit < 0) {
+      if (!costKnown) {
+        // Без введённой себестоимости маржу с единицы честно посчитать нельзя — не подставляем
+        // 0 или 100%, а прямо просим ввести цифру, прежде чем на неё полагаться.
+        flag = 'warning';
+        reason = 'Себестоимость не указана — маржа с единицы не может быть посчитана';
+      } else if (revenue > 0 && periodProfit < 0) {
         flag = 'critical';
         reason = 'Убыток за период: расходы на товар превышают выручку по нему';
-      } else if (unitMargin < 0.1) {
+      } else if (unitMargin !== null && unitMargin < 0.1) {
         flag = 'warning';
         reason = `Маржа с единицы всего ${(unitMargin * 100).toFixed(1)}%`;
       } else if (revenue === 0 && cogsFromTx > 0) {

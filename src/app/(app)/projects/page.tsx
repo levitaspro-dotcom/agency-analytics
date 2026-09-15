@@ -3,7 +3,7 @@ import { revalidatePath } from 'next/cache';
 import { requireUser, isManagerOrAbove, assertProjectAccess } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
-import { testOzonConnection, fetchOzonFinanceTransactions, type OzonOperation } from '@/lib/integrations/ozon';
+import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, type OzonOperation } from '@/lib/integrations/ozon';
 
 export const dynamic = 'force-dynamic';
 
@@ -142,14 +142,39 @@ async function syncStoreAction(formData: FormData) {
 
   const to = new Date();
   const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000);
+  const creds = { clientId: store.ozonClientId, apiKey: decryptSecret(store.ozonApiKeyEncrypted) };
+
+  // Сначала каталог товаров — чтобы при сохранении финансовых операций сразу знать,
+  // к какому Product привязывать каждую строку (сопоставление по Ozon SKU).
+  let productsResult: { ok: boolean; message: string; products: { sku: string; offerId: string; name: string; sellPrice: number }[] };
+  try {
+    productsResult = await fetchOzonProducts(creds);
+  } catch (e) {
+    productsResult = { ok: false, message: (e as Error).message, products: [] };
+  }
+
+  const productIdBySku = new Map<string, string>();
+  let productsImported = 0;
+  if (productsResult.ok) {
+    for (const p of productsResult.products) {
+      const existing = await prisma.product.findFirst({ where: { projectId: store.projectId, storeId: store.id, sku: p.sku } });
+      if (existing) {
+        // Себестоимость — поле, которое заполняет вручную Ольга/менеджер, синхронизация её никогда не трогает.
+        await prisma.product.update({ where: { id: existing.id }, data: { name: p.name, sellPrice: p.sellPrice } });
+        productIdBySku.set(p.sku, existing.id);
+      } else {
+        const created = await prisma.product.create({
+          data: { projectId: store.projectId, storeId: store.id, sku: p.sku, name: p.name, sellPrice: p.sellPrice, costPrice: 0 },
+        });
+        productIdBySku.set(p.sku, created.id);
+        productsImported += 1;
+      }
+    }
+  }
 
   let syncResult: { ok: boolean; message: string; operations: OzonOperation[] };
   try {
-    syncResult = await fetchOzonFinanceTransactions(
-      { clientId: store.ozonClientId, apiKey: decryptSecret(store.ozonApiKeyEncrypted) },
-      from,
-      to,
-    );
+    syncResult = await fetchOzonFinanceTransactions(creds, from, to);
   } catch (e) {
     syncResult = { ok: false, message: (e as Error).message, operations: [] };
   }
@@ -159,6 +184,7 @@ async function syncStoreAction(formData: FormData) {
     const rows: {
       projectId: string;
       storeId: string;
+      productId: string | null;
       type: 'REVENUE' | 'OZON_FEE';
       category: string;
       amount: number;
@@ -171,11 +197,13 @@ async function syncStoreAction(formData: FormData) {
       const accrual = op.accruals_for_sale || 0;
       const net = op.amount || 0;
       const fee = accrual - net;
+      const productId = op.sku ? productIdBySku.get(op.sku) ?? null : null;
 
       if (accrual > 0) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
+          productId,
           type: 'REVENUE',
           category: 'Продажи Ozon',
           amount: accrual,
@@ -187,6 +215,7 @@ async function syncStoreAction(formData: FormData) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
+          productId,
           type: 'OZON_FEE',
           category: op.operation_type_name || 'Комиссия Ozon',
           amount: fee,
@@ -197,6 +226,7 @@ async function syncStoreAction(formData: FormData) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
+          productId,
           type: 'OZON_FEE',
           category: op.operation_type_name || 'Комиссия Ozon',
           amount: Math.abs(net),
@@ -207,6 +237,7 @@ async function syncStoreAction(formData: FormData) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
+          productId,
           type: 'REVENUE',
           category: op.operation_type_name || 'Прочие начисления Ozon',
           amount: net,
@@ -222,21 +253,62 @@ async function syncStoreAction(formData: FormData) {
     }
   }
 
+  const parts = [
+    productsResult.ok ? `товаров: ${productsResult.products.length} (новых: ${productsImported})` : `товары — ошибка: ${productsResult.message}`,
+    syncResult.ok ? `${syncResult.message} · новых операций сохранено: ${imported}` : `операции — ошибка: ${syncResult.message}`,
+  ];
+  const overallOk = productsResult.ok && syncResult.ok;
+
   await prisma.store.update({
     where: { id: storeId },
     data: {
       lastSyncAt: new Date(),
-      lastSyncOk: syncResult.ok,
-      lastSyncMessage: syncResult.ok ? `${syncResult.message} · новых операций сохранено: ${imported}` : syncResult.message,
+      lastSyncOk: overallOk,
+      lastSyncMessage: parts.join(' · '),
       lastSyncCount: imported,
     },
   });
   await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'store.sync', targetType: 'Store', targetId: storeId, meta: { ok: syncResult.ok, imported, days } },
+    data: {
+      actorId: user.id,
+      actorName: user.name,
+      action: 'store.sync',
+      targetType: 'Store',
+      targetId: storeId,
+      meta: { ok: overallOk, imported, productsImported, days },
+    },
   });
   revalidatePath('/projects');
   revalidatePath('/dashboard');
   revalidatePath('/expenses');
+  revalidatePath('/products');
+}
+
+export async function updateProductCostAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const productId = String(formData.get('productId') || '');
+  const costPriceRaw = String(formData.get('costPrice') || '').replace(',', '.').trim();
+  if (!productId) return;
+  const costPrice = Number(costPriceRaw);
+  if (!Number.isFinite(costPrice) || costPrice < 0) return;
+
+  const product = await prisma.product.findUniqueOrThrow({ where: { id: productId } });
+  await assertProjectAccess(user, product.projectId);
+
+  await prisma.product.update({ where: { id: productId }, data: { costPrice } });
+  await prisma.activityLog.create({
+    data: {
+      actorId: user.id,
+      actorName: user.name,
+      action: 'product.setCostPrice',
+      targetType: 'Product',
+      targetId: productId,
+      meta: { sku: product.sku, costPrice },
+    },
+  });
+  revalidatePath('/products');
 }
 
 async function deleteStoreAction(formData: FormData) {
