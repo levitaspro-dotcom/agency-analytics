@@ -3,6 +3,8 @@ import { revalidatePath } from 'next/cache';
 import bcrypt from 'bcryptjs';
 import { requireUser } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
+import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
+import { createAdapter } from '@/lib/ai';
 
 export const dynamic = 'force-dynamic';
 
@@ -10,6 +12,11 @@ const ROLE_LABEL: Record<string, string> = {
   SUPER_ADMIN: 'Главный администратор',
   MANAGER: 'Менеджер',
   CLIENT: 'Клиент',
+};
+
+const AI_PROVIDER_LABEL: Record<string, string> = {
+  ANTHROPIC: 'Anthropic Claude',
+  OPENAI: 'OpenAI',
 };
 
 async function createUserAction(formData: FormData) {
@@ -70,31 +77,116 @@ async function deleteUserAction(formData: FormData) {
   revalidatePath('/projects');
 }
 
+async function saveAiProviderAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const provider = String(formData.get('provider') || 'ANTHROPIC') as 'ANTHROPIC' | 'OPENAI';
+  const model = String(formData.get('model') || '').trim();
+  const apiKey = String(formData.get('apiKey') || '').trim();
+  if (!model || !apiKey) return;
+
+  // Предыдущая конфигурация не удаляется (остаётся в истории), а деактивируется —
+  // активна всегда ровно одна. Старый ключ нигде повторно не показывается.
+  await prisma.$transaction([
+    prisma.aiProviderConfig.updateMany({ where: { active: true }, data: { active: false } }),
+    prisma.aiProviderConfig.create({
+      data: { provider, model, apiKeyEncrypted: encryptSecret(apiKey), apiKeyLast4: last4(apiKey), active: true },
+    }),
+  ]);
+  await prisma.activityLog.create({
+    data: { actorId: admin.id, actorName: admin.name, action: 'ai.configure', targetType: 'AiProviderConfig', meta: { provider, model } },
+  });
+  revalidatePath('/settings');
+  revalidatePath('/ai-analyst');
+}
+
+async function testAiProviderAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const configId = String(formData.get('configId') || '');
+  const config = configId ? await prisma.aiProviderConfig.findUnique({ where: { id: configId } }) : null;
+  if (!config) return;
+
+  const adapter = createAdapter(config.provider, { apiKey: decryptSecret(config.apiKeyEncrypted), model: config.model });
+  const result = await adapter.testConnection();
+
+  await prisma.aiProviderConfig.update({
+    where: { id: config.id },
+    data: { lastTestAt: new Date(), lastTestOk: result.ok, lastTestMessage: result.message },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: admin.id, actorName: admin.name, action: 'ai.testConnection', targetType: 'AiProviderConfig', targetId: config.id, meta: result },
+  });
+  revalidatePath('/settings');
+}
+
 export default async function SettingsPage() {
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') redirect('/dashboard');
 
   const users = await prisma.user.findMany({ orderBy: { createdAt: 'asc' } });
   const activity = await prisma.activityLog.findMany({ orderBy: { createdAt: 'desc' }, take: 30, include: { actor: true } });
+  const aiConfig = await prisma.aiProviderConfig.findFirst({ where: { active: true }, orderBy: { updatedAt: 'desc' } });
 
   return (
     <div>
       <div className="panel">
         <h2>Настройки → ИИ</h2>
-        <div className="stub-note">
-          Подключение провайдера ИИ (адрес API, ключ, модель, разрешённые функции, лимиты, проверка подключения) —
-          общее для сервиса и отдельное на проект — реализуется на следующем этапе как заменяемый серверный адаптер,
-          без привязки к конкретной модели. Ключи не будут раскрываться в интерфейсе даже администратору: только
-          «заменить» и «проверить подключение». Отсутствие подключения не влияет на работу дашборда.
-        </div>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
+          Провайдер подключается как заменяемый серверный адаптер — не привязан к конкретной модели. Ключ хранится в
+          зашифрованном виде и повторно нигде не показывается — только последние 4 символа. Отсутствие подключения не
+          влияет на работу финансового дашборда, только на раздел «ИИ-аналитик».
+        </p>
+
+        {aiConfig ? (
+          <div style={{ marginBottom: 16, fontSize: 13.5 }}>
+            <div style={{ marginBottom: 4 }}>
+              <b>{AI_PROVIDER_LABEL[aiConfig.provider] ?? aiConfig.provider}</b> · модель <code>{aiConfig.model}</code> · ключ
+              ••••{aiConfig.apiKeyLast4}
+            </div>
+            <div style={{ marginBottom: 8 }}>
+              {aiConfig.lastTestAt ? (
+                <span className={`pill ${aiConfig.lastTestOk ? 'ok' : 'critical'}`}>{aiConfig.lastTestOk ? 'Подключено' : 'Ошибка'}</span>
+              ) : (
+                <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не проверялось</span>
+              )}
+              {aiConfig.lastTestMessage && (
+                <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 8 }}>{aiConfig.lastTestMessage}</span>
+              )}
+            </div>
+            <form action={testAiProviderAction}>
+              <input type="hidden" name="configId" value={aiConfig.id} />
+              <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                Проверить подключение
+              </button>
+            </form>
+          </div>
+        ) : (
+          <div className="empty-state" style={{ padding: '10px 0' }}>ИИ пока не подключён.</div>
+        )}
+
+        <h3>{aiConfig ? 'Заменить провайдера' : 'Подключить провайдера'}</h3>
+        <form action={saveAiProviderAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <select name="provider" defaultValue="ANTHROPIC">
+            <option value="ANTHROPIC">Anthropic Claude</option>
+            <option value="OPENAI">OpenAI</option>
+          </select>
+          <input type="text" name="model" placeholder="Например, claude-sonnet-4-5" required style={{ minWidth: 200 }} />
+          <input type="password" name="apiKey" placeholder="Api-Key" autoComplete="off" required />
+          <button className="btn btn-primary" type="submit">
+            Сохранить
+          </button>
+        </form>
       </div>
 
       <div className="panel">
         <h2>Интеграции Ozon</h2>
-        <div className="stub-note">
-          Автоматическая синхронизация с личным кабинетом Ozon (заказы, комиссии, реклама, остатки) войдёт в
-          следующий этап. Сейчас данные вносятся как финансовые операции проекта (см. модель `FinanceTransaction`).
-        </div>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 0 }}>
+          Подключение магазинов Ozon (Client-Id/Api-Key), проверка подключения и синхронизация финансовых операций
+          выполняются в разделе <a href="/projects">«Проекты» → «Магазины Ozon»</a>, отдельно по каждому проекту.
+        </p>
       </div>
 
       <div className="panel">

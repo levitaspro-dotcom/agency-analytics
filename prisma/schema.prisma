@@ -21,15 +21,22 @@ enum TransactionType {
   TAX
 }
 
+enum AiProvider {
+  ANTHROPIC
+  OPENAI
+}
+
 model User {
-  id           String              @id @default(cuid())
-  email        String              @unique
-  passwordHash String
-  name         String
-  role         UserRole
-  createdAt    DateTime            @default(now())
-  assignments  ProjectAssignment[]
-  activity     ActivityLog[]
+  id                String              @id @default(cuid())
+  email             String              @unique
+  passwordHash      String
+  name              String
+  role              UserRole
+  createdAt         DateTime            @default(now())
+  assignments       ProjectAssignment[]
+  activity          ActivityLog[]
+  aiMessages        AiMessage[]
+  aiRecommendations AiRecommendation[]
 }
 
 model Client {
@@ -40,15 +47,17 @@ model Client {
 }
 
 model Project {
-  id           String                @id @default(cuid())
-  clientId     String
-  client       Client                @relation(fields: [clientId], references: [id])
-  name         String
-  createdAt    DateTime              @default(now())
-  stores       Store[]
-  products     Product[]
-  transactions FinanceTransaction[]
-  assignments  ProjectAssignment[]
+  id                String                @id @default(cuid())
+  clientId          String
+  client            Client                @relation(fields: [clientId], references: [id])
+  name              String
+  createdAt         DateTime              @default(now())
+  stores            Store[]
+  products          Product[]
+  transactions      FinanceTransaction[]
+  assignments       ProjectAssignment[]
+  aiMessages        AiMessage[]
+  aiRecommendations AiRecommendation[]
 }
 
 model Store {
@@ -128,4 +137,64 @@ model ActivityLog {
   targetId   String?
   meta       Json?
   createdAt  DateTime @default(now())
+}
+
+/// Настройка серверного ИИ-адаптера (заменяемый, не привязан к конкретной модели).
+/// Ключ хранится в зашифрованном виде и никогда не отдаётся обратно в интерфейс.
+/// Одновременно активна только одна конфигурация — замена деактивирует предыдущую,
+/// не удаляя её (история подключений сохраняется).
+model AiProviderConfig {
+  id              String     @id @default(cuid())
+  provider        AiProvider
+  model           String
+  apiKeyEncrypted String
+  apiKeyLast4     String
+  active          Boolean    @default(true)
+  lastTestAt      DateTime?
+  lastTestOk      Boolean?
+  lastTestMessage String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+}
+
+/// История переписки с ИИ-аналитиком по проекту (доступ — как и к остальным данным проекта).
+model AiMessage {
+  id        String    @id @default(cuid())
+  projectId String
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  userId    String?
+  user      User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userName  String?
+  role      String
+  content   String
+  dataAsOf  DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([projectId, createdAt])
+}
+
+/// Проверяемая рекомендация ИИ-аналитика: структурированные поля + на каких именно
+/// цифрах она основана (evidence) и на какой момент данные считались актуальными (dataAsOf),
+/// чтобы было видно, не устарела ли рекомендация.
+model AiRecommendation {
+  id              String   @id @default(cuid())
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdByUserId String?
+  createdByUser   User?    @relation(fields: [createdByUserId], references: [id], onDelete: SetNull)
+  createdByName   String?
+  problem         String
+  scope           String
+  metrics         String
+  action          String
+  priority        String
+  expectedEffect  String?
+  assumptions     String
+  evidence        String
+  evidenceHref    String?
+  dataAsOf        DateTime
+  rawModelOutput  String?
+  createdAt       DateTime @default(now())
+
+  @@index([projectId, createdAt])
 }
