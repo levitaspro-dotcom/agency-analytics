@@ -52,14 +52,24 @@ model Project {
 }
 
 model Store {
-  id           String                @id @default(cuid())
-  projectId    String
-  project      Project               @relation(fields: [projectId], references: [id])
-  name         String
-  ozonShopId   String?
-  createdAt    DateTime              @default(now())
-  products     Product[]
-  transactions FinanceTransaction[]
+  id                  String                @id @default(cuid())
+  projectId           String
+  project             Project               @relation(fields: [projectId], references: [id])
+  name                String
+  ozonShopId          String?
+  ozonClientId        String?
+  ozonApiKeyEncrypted String?
+  ozonApiKeyLast4     String?
+  lastTestAt          DateTime?
+  lastTestOk          Boolean?
+  lastTestMessage     String?
+  lastSyncAt          DateTime?
+  lastSyncOk          Boolean?
+  lastSyncMessage     String?
+  lastSyncCount       Int?
+  createdAt           DateTime              @default(now())
+  products            Product[]
+  transactions        FinanceTransaction[]
 }
 
 model ProjectAssignment {
@@ -101,9 +111,11 @@ model FinanceTransaction {
   amount      Float
   date        DateTime
   description String?
+  externalId  String?
   createdAt   DateTime         @default(now())
 
   @@index([projectId, date])
+  @@unique([storeId, externalId])
 }
 
 model ActivityLog {

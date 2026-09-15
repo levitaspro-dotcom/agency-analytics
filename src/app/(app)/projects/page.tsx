@@ -1,7 +1,9 @@
 import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
-import { requireUser, isManagerOrAbove } from '@/lib/authz';
+import { requireUser, isManagerOrAbove, assertProjectAccess } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
+import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
+import { testOzonConnection, fetchOzonFinanceTransactions, type OzonOperation } from '@/lib/integrations/ozon';
 
 export const dynamic = 'force-dynamic';
 
@@ -61,6 +63,180 @@ async function removeAssignmentAction(formData: FormData) {
     data: { actorId: user.id, action: 'assignment.remove', targetType: 'Project', targetId: a.projectId, meta: { userId: a.userId } },
   });
   revalidatePath('/projects');
+}
+
+async function addStoreAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  const name = String(formData.get('name') || '').trim();
+  const ozonClientId = String(formData.get('ozonClientId') || '').trim();
+  const ozonApiKey = String(formData.get('ozonApiKey') || '').trim();
+  if (!projectId || !name) return;
+  await assertProjectAccess(user, projectId);
+
+  const store = await prisma.store.create({
+    data: {
+      projectId,
+      name,
+      ozonClientId: ozonClientId || null,
+      ozonApiKeyEncrypted: ozonApiKey ? encryptSecret(ozonApiKey) : null,
+      ozonApiKeyLast4: ozonApiKey ? last4(ozonApiKey) : null,
+    },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, action: 'store.create', targetType: 'Store', targetId: store.id, meta: { name, projectId } },
+  });
+  revalidatePath('/projects');
+}
+
+async function testStoreConnectionAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const storeId = String(formData.get('storeId') || '');
+  if (!storeId) return;
+  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
+  await assertProjectAccess(user, store.projectId);
+
+  let result: { ok: boolean; message: string };
+  if (!store.ozonClientId || !store.ozonApiKeyEncrypted) {
+    result = { ok: false, message: 'Сначала укажите Client-Id и Api-Key.' };
+  } else {
+    try {
+      result = await testOzonConnection({ clientId: store.ozonClientId, apiKey: decryptSecret(store.ozonApiKeyEncrypted) });
+    } catch (e) {
+      result = { ok: false, message: (e as Error).message };
+    }
+  }
+
+  await prisma.store.update({
+    where: { id: storeId },
+    data: { lastTestAt: new Date(), lastTestOk: result.ok, lastTestMessage: result.message },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, action: 'store.testConnection', targetType: 'Store', targetId: storeId, meta: result },
+  });
+  revalidatePath('/projects');
+}
+
+async function syncStoreAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const storeId = String(formData.get('storeId') || '');
+  const days = Math.min(60, Math.max(1, Number(formData.get('days') || 30)));
+  if (!storeId) return;
+  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
+  await assertProjectAccess(user, store.projectId);
+
+  if (!store.ozonClientId || !store.ozonApiKeyEncrypted) {
+    await prisma.store.update({
+      where: { id: storeId },
+      data: { lastSyncAt: new Date(), lastSyncOk: false, lastSyncMessage: 'Сначала укажите Client-Id и Api-Key.' },
+    });
+    revalidatePath('/projects');
+    return;
+  }
+
+  const to = new Date();
+  const from = new Date(to.getTime() - days * 24 * 60 * 60 * 1000);
+
+  let syncResult: { ok: boolean; message: string; operations: OzonOperation[] };
+  try {
+    syncResult = await fetchOzonFinanceTransactions(
+      { clientId: store.ozonClientId, apiKey: decryptSecret(store.ozonApiKeyEncrypted) },
+      from,
+      to,
+    );
+  } catch (e) {
+    syncResult = { ok: false, message: (e as Error).message, operations: [] };
+  }
+
+  let imported = 0;
+  if (syncResult.ok) {
+    const rows: {
+      projectId: string;
+      storeId: string;
+      type: 'REVENUE' | 'OZON_FEE';
+      category: string;
+      amount: number;
+      date: Date;
+      externalId: string;
+    }[] = [];
+
+    for (const op of syncResult.operations) {
+      const date = new Date(op.operation_date);
+      const accrual = op.accruals_for_sale || 0;
+      const net = op.amount || 0;
+      const fee = accrual - net;
+
+      if (accrual > 0) {
+        rows.push({
+          projectId: store.projectId,
+          storeId: store.id,
+          type: 'REVENUE',
+          category: 'Продажи Ozon',
+          amount: accrual,
+          date,
+          externalId: `${op.operation_id}:revenue`,
+        });
+      }
+      if (fee > 0) {
+        rows.push({
+          projectId: store.projectId,
+          storeId: store.id,
+          type: 'OZON_FEE',
+          category: op.operation_type_name || 'Комиссия Ozon',
+          amount: fee,
+          date,
+          externalId: `${op.operation_id}:fee`,
+        });
+      } else if (accrual === 0 && net < 0) {
+        rows.push({
+          projectId: store.projectId,
+          storeId: store.id,
+          type: 'OZON_FEE',
+          category: op.operation_type_name || 'Комиссия Ozon',
+          amount: Math.abs(net),
+          date,
+          externalId: `${op.operation_id}:fee`,
+        });
+      } else if (accrual === 0 && net > 0) {
+        rows.push({
+          projectId: store.projectId,
+          storeId: store.id,
+          type: 'REVENUE',
+          category: op.operation_type_name || 'Прочие начисления Ozon',
+          amount: net,
+          date,
+          externalId: `${op.operation_id}:revenue`,
+        });
+      }
+    }
+
+    if (rows.length > 0) {
+      const created = await prisma.financeTransaction.createMany({ data: rows, skipDuplicates: true });
+      imported = created.count;
+    }
+  }
+
+  await prisma.store.update({
+    where: { id: storeId },
+    data: {
+      lastSyncAt: new Date(),
+      lastSyncOk: syncResult.ok,
+      lastSyncMessage: syncResult.ok ? `${syncResult.message} · новых операций сохранено: ${imported}` : syncResult.message,
+      lastSyncCount: imported,
+    },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, action: 'store.sync', targetType: 'Store', targetId: storeId, meta: { ok: syncResult.ok, imported, days } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/dashboard');
+  revalidatePath('/expenses');
 }
 
 export default async function ProjectsPage() {
@@ -147,6 +323,107 @@ export default async function ProjectsPage() {
             </table>
           </div>
         ))}
+      </div>
+
+      <div className="panel">
+        <h2>Магазины Ozon</h2>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
+          Client-Id и Api-Key берутся в личном кабинете Ozon Seller: Настройки → Seller API. Ключ хранится на
+          сервере в зашифрованном виде и повторно нигде не показывается — только последние 4 символа, чтобы
+          понять, какой ключ сохранён.
+        </p>
+
+        {visibleClients.flatMap((c) => c.projects).every((p) => p.stores.length === 0) && (
+          <div className="empty-state">Магазинов пока нет — добавьте первый ниже.</div>
+        )}
+
+        {visibleClients.map((client) =>
+          client.projects
+            .filter((p) => p.stores.length > 0)
+            .map((p) => (
+              <div key={p.id} style={{ marginBottom: 18 }}>
+                <h3>
+                  {client.name} · {p.name}
+                </h3>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Магазин</th>
+                      <th>Client-Id</th>
+                      <th>Api-Key</th>
+                      <th>Проверка подключения</th>
+                      <th>Синхронизация за 30 дней</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {p.stores.map((s) => (
+                      <tr key={s.id}>
+                        <td>{s.name}</td>
+                        <td style={{ fontVariantNumeric: 'tabular-nums' }}>{s.ozonClientId || '—'}</td>
+                        <td>{s.ozonApiKeyLast4 ? `••••${s.ozonApiKeyLast4}` : '—'}</td>
+                        <td>
+                          <div style={{ marginBottom: 6 }}>
+                            {s.lastTestAt ? (
+                              <span className={`pill ${s.lastTestOk ? 'ok' : 'critical'}`}>{s.lastTestOk ? 'Подключено' : 'Ошибка'}</span>
+                            ) : (
+                              <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не проверялось</span>
+                            )}
+                            {s.lastTestMessage && (
+                              <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>{s.lastTestMessage}</div>
+                            )}
+                          </div>
+                          <form action={testStoreConnectionAction}>
+                            <input type="hidden" name="storeId" value={s.id} />
+                            <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                              Проверить
+                            </button>
+                          </form>
+                        </td>
+                        <td>
+                          <div style={{ marginBottom: 6 }}>
+                            {s.lastSyncAt ? (
+                              <span className={`pill ${s.lastSyncOk ? 'ok' : 'critical'}`}>{s.lastSyncOk ? 'Успешно' : 'Ошибка'}</span>
+                            ) : (
+                              <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не запускалась</span>
+                            )}
+                            {s.lastSyncMessage && (
+                              <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>{s.lastSyncMessage}</div>
+                            )}
+                          </div>
+                          <form action={syncStoreAction}>
+                            <input type="hidden" name="storeId" value={s.id} />
+                            <input type="hidden" name="days" value={30} />
+                            <button className="btn btn-primary" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                              Синхронизировать
+                            </button>
+                          </form>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )),
+        )}
+
+        <h3>Добавить магазин</h3>
+        <form action={addStoreAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <select name="projectId">
+            {visibleClients.flatMap((c) =>
+              c.projects.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {c.name} · {p.name}
+                </option>
+              )),
+            )}
+          </select>
+          <input type="text" name="name" placeholder="Название магазина" required />
+          <input type="text" name="ozonClientId" placeholder="Ozon Client-Id" />
+          <input type="password" name="ozonApiKey" placeholder="Ozon Api-Key" autoComplete="off" />
+          <button className="btn btn-primary" type="submit">
+            Добавить
+          </button>
+        </form>
       </div>
 
       {isAdmin && (
