@@ -51,6 +51,8 @@ model Project {
   clientId          String
   client            Client                @relation(fields: [clientId], references: [id])
   name              String
+  /** Ставка налога в процентах от выручки (например 6 для УСН «Доходы» 6%). 0/не задано — налог не считается автоматически. Задаётся вручную, синхронизация её не трогает. */
+  taxRatePercent    Float                 @default(0)
   createdAt         DateTime              @default(now())
   stores            Store[]
   products          Product[]
@@ -101,6 +103,8 @@ model Product {
   store        Store?                @relation(fields: [storeId], references: [id])
   name         String
   sku          String
+  /** Артикул продавца (offer_id) — стабильный ключ сопоставления с каталогом Ozon при повторных синхронизациях, в отличие от числового sku, который иногда недоступен сразу. */
+  offerId      String?
   sellPrice    Float
   costPrice    Float
   createdAt    DateTime              @default(now())

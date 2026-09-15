@@ -74,6 +74,8 @@ export interface OzonOperation {
   sale_commission?: number;
   /** Ozon SKU товара, к которому относится эта строка начисления (если есть) — используется для привязки операции к карточке товара. */
   sku?: string;
+  /** Количество единиц товара в этой строке начисления — нужно, чтобы посчитать себестоимость проданного (quantity × Product.costPrice), которую сам Ozon не знает. */
+  quantity?: number;
 }
 
 export interface OzonSyncResult {
@@ -182,31 +184,50 @@ function shortJsonPreview(json: any): string {
 /**
  * Справочник названий типов начислений (/v1/finance/accrual/types). Лучшее из
  * возможного: если запрос не удастся или формат окажется иным — просто покажем
- * числовой код типа вместо названия, на деньгах это никак не сказывается.
+ * числовой код типа вместо названия, на деньгах это никак не сказывается. Если
+ * распознать список не удалось, возвращаем короткий диагностический фрагмент
+ * ответа, чтобы можно было быстро донастроить сопоставление полей.
  */
-async function fetchAccrualTypeNames(creds: OzonCredentials): Promise<Map<number, string>> {
+async function fetchAccrualTypeNames(creds: OzonCredentials): Promise<{ map: Map<number, string>; diagnostic: string | null }> {
   const map = new Map<number, string>();
   try {
-    const { ok, json } = await ozonFetch(creds, '/v1/finance/accrual/types', {});
-    if (!ok) return map;
-    const candidates = [json?.result, json?.result?.types, json?.types, json?.accrual_types];
+    const { ok, status, json } = await ozonFetch(creds, '/v1/finance/accrual/types', { language: 'RU' });
+    if (!ok) return { map, diagnostic: `запрос не удался (${status})` };
+
+    // Вариант 1: список объектов [{ type_id/id, name/title/... }]
+    const listCandidates = [json?.result, json?.result?.types, json?.types, json?.accrual_types, json];
     let list: any[] | null = null;
-    for (const c of candidates) {
+    for (const c of listCandidates) {
       if (Array.isArray(c)) {
         list = c;
         break;
       }
     }
-    if (!list) return map;
-    for (const t of list) {
-      const id = t?.type_id ?? t?.id;
-      const name = t?.name ?? t?.title ?? t?.type_name;
-      if (id !== undefined && id !== null && name) map.set(Number(id), String(name));
+    if (list) {
+      for (const t of list) {
+        const id = t?.type_id ?? t?.id ?? t?.code;
+        const name = t?.name ?? t?.name_ru ?? t?.title ?? t?.title_ru ?? t?.type_name ?? t?.description;
+        if (id !== undefined && id !== null && name) map.set(Number(id), String(name));
+      }
+      if (map.size > 0) return { map, diagnostic: null };
     }
-  } catch {
-    // не критично — работаем дальше с числовыми кодами
+
+    // Вариант 2: объект-словарь { "38": "Название", ... }
+    const dictCandidates = [json?.result, json?.types, json?.accrual_types, json];
+    for (const d of dictCandidates) {
+      if (d && typeof d === 'object' && !Array.isArray(d)) {
+        for (const [k, v] of Object.entries(d)) {
+          const id = Number(k);
+          if (!Number.isNaN(id) && typeof v === 'string') map.set(id, v);
+        }
+        if (map.size > 0) return { map, diagnostic: null };
+      }
+    }
+
+    return { map, diagnostic: shortJsonPreview(json) };
+  } catch (e) {
+    return { map, diagnostic: `исключение: ${(e as Error).message}` };
   }
-  return map;
 }
 
 /**
@@ -239,6 +260,7 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
         accruals_for_sale: amount > 0 ? amount : 0,
         amount,
         sku: a.sku !== undefined && a.sku !== null ? String(a.sku) : undefined,
+        quantity: Number.isFinite(Number(a.quantity)) && Number(a.quantity) > 0 ? Number(a.quantity) : undefined,
       });
     }
   }
@@ -276,7 +298,7 @@ export async function fetchOzonFinanceTransactions(
     return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations };
   }
 
-  const typeNames = await fetchAccrualTypeNames(creds);
+  const { map: typeNames, diagnostic: typeNamesDiagnostic } = await fetchAccrualTypeNames(creds);
   let unrecognizedSample: string | null = null;
   let postingsWithAccrualsSeen = 0;
 
@@ -316,16 +338,19 @@ export async function fetchOzonFinanceTransactions(
   }
 
   const notePosting = postingErrors.length > 0 ? ` (не удалось проверить часть отправлений: ${postingErrors.join('; ')})` : '';
+  const noteTypeNames = typeNamesDiagnostic ? ` · названия категорий не распознаны (${typeNamesDiagnostic})` : '';
   return {
     ok: true,
-    message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}`,
+    message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}${noteTypeNames}`,
     operations,
   };
 }
 
 export interface OzonProduct {
-  /** Числовой SKU Ozon — по нему сопоставляем товар с финансовыми операциями (accrual-строки несут именно его). */
+  /** Числовой SKU Ozon для отображения. */
   sku: string;
+  /** Все известные варианты SKU этого товара (обычный/FBO/FBS) — начисления могут нести любой из них, поэтому сопоставляем по всем сразу, а не только по одному «главному». */
+  skuAliases: string[];
   offerId: string;
   name: string;
   sellPrice: number;
@@ -373,7 +398,7 @@ export async function fetchOzonProducts(creds: OzonCredentials): Promise<OzonPro
     return { ok: true, message: 'В магазине пока нет товаров на Ozon.', products: [] };
   }
 
-  const priceByOfferId = new Map<string, { sku: string; sellPrice: number }>();
+  const priceByOfferId = new Map<string, { skus: string[]; sellPrice: number }>();
   for (const batch of chunkArray(items.map((i) => i.offerId), 1000)) {
     let cursor = '';
     for (let guard = 0; guard < 20; guard++) {
@@ -386,9 +411,11 @@ export async function fetchOzonProducts(creds: OzonCredentials): Promise<OzonPro
       const list: any[] = json?.items ?? json?.result?.items ?? [];
       for (const it of list) {
         const offerId = it?.offer_id !== undefined ? String(it.offer_id) : undefined;
-        const sku = it?.sku !== undefined && it?.sku !== null ? String(it.sku) : offerId;
         const sellPrice = Number(it?.price?.price ?? it?.price ?? 0) || 0;
-        if (offerId) priceByOfferId.set(offerId, { sku: sku ?? offerId, sellPrice });
+        const skus = [it?.sku, it?.fbo_sku, it?.fbs_sku]
+          .filter((v) => v !== undefined && v !== null && v !== 0)
+          .map((v) => String(v));
+        if (offerId) priceByOfferId.set(offerId, { skus, sellPrice });
       }
       const nextCursor = json?.cursor ?? json?.result?.cursor;
       if (!nextCursor || list.length === 0) break;
@@ -397,21 +424,29 @@ export async function fetchOzonProducts(creds: OzonCredentials): Promise<OzonPro
   }
 
   const nameByOfferId = new Map<string, string>();
+  const extraSkusByOfferId = new Map<string, string[]>();
   for (const batch of chunkArray(items.map((i) => i.productId).filter(Boolean), 1000)) {
     const { ok, json } = await ozonFetch(creds, '/v3/product/info/list', { product_id: batch });
-    if (!ok) continue; // название — не критично для денег, при неудаче остаётся артикул
+    if (!ok) continue; // название и доп. SKU — не критично для денег, при неудаче остаётся то, что уже есть
     const list: any[] = json?.result?.items ?? json?.items ?? [];
     for (const it of list) {
       const offerId = it?.offer_id !== undefined ? String(it.offer_id) : undefined;
+      if (!offerId) continue;
       const name = it?.name;
-      if (offerId && name) nameByOfferId.set(offerId, String(name));
+      if (name) nameByOfferId.set(offerId, String(name));
+      const skus = [it?.sku, it?.fbo_sku, it?.fbs_sku]
+        .filter((v) => v !== undefined && v !== null && v !== 0)
+        .map((v) => String(v));
+      if (skus.length > 0) extraSkusByOfferId.set(offerId, skus);
     }
   }
 
   const products: OzonProduct[] = items.map((it) => {
     const priceInfo = priceByOfferId.get(it.offerId);
+    const skuAliases = Array.from(new Set([...(priceInfo?.skus ?? []), ...(extraSkusByOfferId.get(it.offerId) ?? [])]));
     return {
-      sku: priceInfo?.sku ?? it.offerId,
+      sku: skuAliases[0] ?? it.offerId,
+      skuAliases: skuAliases.length > 0 ? skuAliases : [it.offerId],
       offerId: it.offerId,
       name: nameByOfferId.get(it.offerId) ?? it.offerId,
       sellPrice: priceInfo?.sellPrice ?? 0,

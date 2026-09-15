@@ -14,6 +14,8 @@ export interface FinanceSummary {
   profit: number;
   margin: number; // 0..1
   byType: Record<TransactionType, CategoryBreakdown>;
+  /** Ставка налога проекта (%), если задана — только для отображения рядом с суммой налога. */
+  taxRatePercent: number;
 }
 
 function sumByCategory(rows: { category: string; amount: number }[]): CategoryBreakdown {
@@ -31,14 +33,17 @@ export async function computeFinanceSummary(params: {
   to: Date;
 }): Promise<FinanceSummary> {
   const { projectId, storeId, from, to } = params;
-  const rows = await prisma.financeTransaction.findMany({
-    where: {
-      projectId,
-      ...(storeId ? { storeId } : {}),
-      date: { gte: from, lte: to },
-    },
-    select: { type: true, category: true, amount: true },
-  });
+  const [rows, project] = await Promise.all([
+    prisma.financeTransaction.findMany({
+      where: {
+        projectId,
+        ...(storeId ? { storeId } : {}),
+        date: { gte: from, lte: to },
+      },
+      select: { type: true, category: true, amount: true },
+    }),
+    prisma.project.findUnique({ where: { id: projectId }, select: { taxRatePercent: true } }),
+  ]);
 
   const byTypeRaw: Record<string, { category: string; amount: number }[]> = {
     REVENUE: [],
@@ -53,20 +58,29 @@ export async function computeFinanceSummary(params: {
   const ozonFees = byTypeRaw.OZON_FEE.reduce((s, r) => s + r.amount, 0);
   const cogs = byTypeRaw.COGS.reduce((s, r) => s + r.amount, 0);
   const externalExpenses = byTypeRaw.EXTERNAL_EXPENSE.reduce((s, r) => s + r.amount, 0);
-  const taxes = byTypeRaw.TAX.reduce((s, r) => s + r.amount, 0);
+  const taxRatePercent = project?.taxRatePercent ?? 0;
+  // Налог считаем по формуле «ставка × выручка» — детерминированно, по заданной вручную ставке,
+  // а не тем, что якобы прислал Ozon (площадка налоги продавца не считает и не знает). Ручные
+  // TAX-операции (если когда-нибудь появятся) складываются с расчётным налогом, а не заменяют его.
+  const manualTaxes = byTypeRaw.TAX.reduce((s, r) => s + r.amount, 0);
+  const computedTax = taxRatePercent > 0 ? revenue * (taxRatePercent / 100) : 0;
+  const taxes = manualTaxes + computedTax;
   const totalExpenses = ozonFees + cogs + externalExpenses + taxes;
   const profit = revenue - totalExpenses;
   const margin = revenue > 0 ? profit / revenue : 0;
+
+  const taxCategories = sumByCategory(byTypeRaw.TAX);
+  if (computedTax > 0) taxCategories.push({ category: `Налог по ставке ${taxRatePercent}% от выручки`, amount: computedTax });
 
   const byType = {
     REVENUE: sumByCategory(byTypeRaw.REVENUE),
     OZON_FEE: sumByCategory(byTypeRaw.OZON_FEE),
     COGS: sumByCategory(byTypeRaw.COGS),
     EXTERNAL_EXPENSE: sumByCategory(byTypeRaw.EXTERNAL_EXPENSE),
-    TAX: sumByCategory(byTypeRaw.TAX),
+    TAX: taxCategories,
   } as Record<TransactionType, CategoryBreakdown>;
 
-  return { revenue, ozonFees, cogs, externalExpenses, taxes, totalExpenses, profit, margin, byType };
+  return { revenue, ozonFees, cogs, externalExpenses, taxes, totalExpenses, profit, margin, byType, taxRatePercent };
 }
 
 export interface ProductInsight {

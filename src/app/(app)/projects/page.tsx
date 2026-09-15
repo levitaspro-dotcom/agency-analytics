@@ -34,6 +34,27 @@ async function createProjectAction(formData: FormData) {
   revalidatePath('/projects');
 }
 
+async function updateProjectTaxRateAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  const taxRateRaw = String(formData.get('taxRatePercent') || '').replace(',', '.').trim();
+  if (!projectId) return;
+  await assertProjectAccess(user, projectId);
+  const taxRatePercent = Number(taxRateRaw);
+  if (!Number.isFinite(taxRatePercent) || taxRatePercent < 0 || taxRatePercent > 100) return;
+
+  await prisma.project.update({ where: { id: projectId }, data: { taxRatePercent } });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'project.setTaxRate', targetType: 'Project', targetId: projectId, meta: { taxRatePercent } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/dashboard');
+  revalidatePath('/expenses');
+  revalidatePath('/reports');
+}
+
 async function assignUserAction(formData: FormData) {
   'use server';
   const user = await requireUser();
@@ -145,29 +166,86 @@ async function syncStoreAction(formData: FormData) {
   const creds = { clientId: store.ozonClientId, apiKey: decryptSecret(store.ozonApiKeyEncrypted) };
 
   // Сначала каталог товаров — чтобы при сохранении финансовых операций сразу знать,
-  // к какому Product привязывать каждую строку (сопоставление по Ozon SKU).
-  let productsResult: { ok: boolean; message: string; products: { sku: string; offerId: string; name: string; sellPrice: number }[] };
+  // к какому Product привязывать каждую строку. Сопоставляем по артикулу продавца
+  // (offer_id) — он стабилен между синхронизациями, в отличие от числового SKU Ozon,
+  // который иногда не отдаётся сразу или отличается для FBO/FBS одного и того же товара.
+  let productsResult: {
+    ok: boolean;
+    message: string;
+    products: { sku: string; skuAliases: string[]; offerId: string; name: string; sellPrice: number }[];
+  };
   try {
     productsResult = await fetchOzonProducts(creds);
   } catch (e) {
     productsResult = { ok: false, message: (e as Error).message, products: [] };
   }
 
-  const productIdBySku = new Map<string, string>();
+  // Ключ — любой известный алиас SKU (обычный/FBO/FBS) → id канонической записи Product.
+  // Финансовые операции Ozon могут прийти с любым из вариантов, поэтому привязываем по всем сразу.
+  type PRow = { id: string; offerId: string | null; costPrice: number };
+  const productIdByAliasSku = new Map<string, string>();
   let productsImported = 0;
   if (productsResult.ok) {
+    const existingByOfferId = (await prisma.product.findMany({
+      where: { projectId: store.projectId, storeId: store.id, offerId: { not: null } },
+    })) as PRow[];
+    const existingByOfferIdMap = new Map<string, PRow>();
+    for (const row of existingByOfferId) if (row.offerId) existingByOfferIdMap.set(row.offerId, row);
+
     for (const p of productsResult.products) {
-      const existing = await prisma.product.findFirst({ where: { projectId: store.projectId, storeId: store.id, sku: p.sku } });
-      if (existing) {
-        // Себестоимость — поле, которое заполняет вручную Ольга/менеджер, синхронизация её никогда не трогает.
-        await prisma.product.update({ where: { id: existing.id }, data: { name: p.name, sellPrice: p.sellPrice } });
-        productIdBySku.set(p.sku, existing.id);
+      // 1) сначала ищем по offer_id — это стабильный ключ, синхронизация его не путает.
+      let canonical: PRow | null = existingByOfferIdMap.get(p.offerId) ?? null;
+
+      // 2) если по offer_id ничего нет — ищем среди старых записей (созданных ещё до
+      // появления offerId, по нестабильному числовому sku) по любому известному алиасу —
+      // это как раз «осиротевшие» дубликаты из прошлых синхронизаций.
+      if (!canonical && p.skuAliases.length > 0) {
+        canonical = (await prisma.product.findFirst({
+          where: { projectId: store.projectId, storeId: store.id, sku: { in: p.skuAliases } },
+        })) as PRow | null;
+      }
+
+      if (canonical) {
+        // Себестоимость — поле, которое заполняет вручную Ольга/менеджер, синхронизация
+        // её никогда не трогает и не перезаписывает.
+        canonical = (await prisma.product.update({
+          where: { id: canonical.id },
+          data: { name: p.name, sellPrice: p.sellPrice, sku: p.sku, offerId: p.offerId },
+        })) as PRow;
       } else {
-        const created = await prisma.product.create({
-          data: { projectId: store.projectId, storeId: store.id, sku: p.sku, name: p.name, sellPrice: p.sellPrice, costPrice: 0 },
-        });
-        productIdBySku.set(p.sku, created.id);
+        canonical = (await prisma.product.create({
+          data: { projectId: store.projectId, storeId: store.id, sku: p.sku, offerId: p.offerId, name: p.name, sellPrice: p.sellPrice, costPrice: 0 },
+        })) as PRow;
         productsImported += 1;
+      }
+
+      const canonicalId: string = canonical.id;
+      for (const alias of p.skuAliases) productIdByAliasSku.set(alias, canonicalId);
+      productIdByAliasSku.set(p.sku, canonicalId);
+
+      // 3) любые другие записи того же товара (дубликаты, накопившиеся в прошлых
+      // синхронизациях под другим алиасом SKU до перехода на offer_id) — сливаем в
+      // каноническую: переносим уже введённую вручную себестоимость (если в канонической
+      // её ещё нет) и переносим на неё финансовые операции, сами дубликаты удаляем, чтобы
+      // не плодить «мёртвые» карточки товаров и не терять привязку операций к товару.
+      const duplicates = (await prisma.product.findMany({
+        where: {
+          projectId: store.projectId,
+          storeId: store.id,
+          id: { not: canonicalId },
+          OR: [{ sku: { in: p.skuAliases.length > 0 ? p.skuAliases : [p.sku] } }, { offerId: p.offerId }],
+        },
+      })) as PRow[];
+      if (duplicates.length > 0) {
+        const recoveredCostPrice = duplicates.find((d) => d.costPrice > 0)?.costPrice;
+        if (canonical.costPrice <= 0 && recoveredCostPrice) {
+          canonical = (await prisma.product.update({ where: { id: canonicalId }, data: { costPrice: recoveredCostPrice } })) as PRow;
+        }
+        await prisma.financeTransaction.updateMany({
+          where: { productId: { in: duplicates.map((d) => d.id) } },
+          data: { productId: canonicalId },
+        });
+        await prisma.product.deleteMany({ where: { id: { in: duplicates.map((d) => d.id) } } });
       }
     }
   }
@@ -179,13 +257,25 @@ async function syncStoreAction(formData: FormData) {
     syncResult = { ok: false, message: (e as Error).message, operations: [] };
   }
 
+  // Себестоимость проданного Ozon не знает и не присылает — считаем сами:
+  // quantity (из строки начисления) × Product.costPrice (введена вручную).
+  // Берём актуальные цены уже после слияния дубликатов выше.
+  const productCostPriceById = new Map<string, number>();
+  {
+    const productIds = Array.from(new Set(productIdByAliasSku.values()));
+    if (productIds.length > 0) {
+      const rows = await prisma.product.findMany({ where: { id: { in: productIds } }, select: { id: true, costPrice: true } });
+      for (const r of rows) productCostPriceById.set(r.id, r.costPrice);
+    }
+  }
+
   let imported = 0;
   if (syncResult.ok) {
     const rows: {
       projectId: string;
       storeId: string;
       productId: string | null;
-      type: 'REVENUE' | 'OZON_FEE';
+      type: 'REVENUE' | 'OZON_FEE' | 'COGS';
       category: string;
       amount: number;
       date: Date;
@@ -197,7 +287,7 @@ async function syncStoreAction(formData: FormData) {
       const accrual = op.accruals_for_sale || 0;
       const net = op.amount || 0;
       const fee = accrual - net;
-      const productId = op.sku ? productIdBySku.get(op.sku) ?? null : null;
+      const productId = op.sku ? productIdByAliasSku.get(op.sku) ?? null : null;
 
       if (accrual > 0) {
         rows.push({
@@ -210,6 +300,23 @@ async function syncStoreAction(formData: FormData) {
           date,
           externalId: `${op.operation_id}:revenue`,
         });
+
+        // Строка начисления с положительной суммой и известным количеством — это
+        // продажа единиц товара: если себестоимость для товара введена, сразу же
+        // признаём её расходом за тот же период, что и выручку по этой же продаже.
+        const costPrice = productId ? productCostPriceById.get(productId) : undefined;
+        if (productId && costPrice && costPrice > 0 && op.quantity && op.quantity > 0) {
+          rows.push({
+            projectId: store.projectId,
+            storeId: store.id,
+            productId,
+            type: 'COGS',
+            category: 'Себестоимость проданных товаров',
+            amount: costPrice * op.quantity,
+            date,
+            externalId: `${op.operation_id}:cogs`,
+          });
+        }
       }
       if (fee > 0) {
         rows.push({
@@ -369,6 +476,9 @@ export default async function ProjectsPage() {
                 <tr>
                   <th>Проект</th>
                   <th>Магазины</th>
+                  <th className="tooltip-hint" title="Ставка налога от выручки (например 6 для УСН «Доходы» 6%) — задаётся вручную, Ozon её не знает и не присылает">
+                    Налог, %
+                  </th>
                   <th>Команда</th>
                   {isAdmin && <th>Назначить</th>}
                 </tr>
@@ -378,6 +488,21 @@ export default async function ProjectsPage() {
                   <tr key={p.id}>
                     <td>{p.name}</td>
                     <td>{p.stores.map((s) => s.name).join(', ') || '—'}</td>
+                    <td>
+                      <form action={updateProjectTaxRateAction} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                        <input type="hidden" name="projectId" value={p.id} />
+                        <input
+                          type="text"
+                          name="taxRatePercent"
+                          defaultValue={p.taxRatePercent > 0 ? p.taxRatePercent : ''}
+                          placeholder="0"
+                          style={{ width: 52, padding: '4px 6px', fontSize: 12.5 }}
+                        />
+                        <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                          ✓
+                        </button>
+                      </form>
+                    </td>
                     <td>
                       {p.assignments.length === 0
                         ? '—'
