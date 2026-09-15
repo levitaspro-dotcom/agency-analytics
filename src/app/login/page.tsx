@@ -1,11 +1,13 @@
 'use client';
 
-import { useState } from 'react';
+import { Suspense, useState } from 'react';
 import { signIn } from 'next-auth/react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 
-export default function LoginPage() {
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const welcome = searchParams.get('welcome') === '1';
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
@@ -30,6 +32,11 @@ export default function LoginPage() {
       <div className="login-card">
         <h1>Вход в систему</h1>
         <p className="sub">Аналитика и ИИ-аудит для проектов агентства</p>
+        {welcome && (
+          <div className="sub" style={{ color: 'var(--ok, #16a34a)' }}>
+            Пароль задан — теперь можно войти.
+          </div>
+        )}
         {error && <div className="error-text">{error}</div>}
         <form onSubmit={onSubmit}>
           <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} required />
@@ -51,5 +58,13 @@ export default function LoginPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
   );
 }

@@ -1,10 +1,30 @@
 import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
+import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
 import { requireUser } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
 import { createAdapter } from '@/lib/ai';
+import { sendEmail, inviteEmailHtml } from '@/lib/email';
+
+function baseUrl() {
+  return (process.env.NEXTAUTH_URL || 'http://localhost:3000').replace(/\/$/, '');
+}
+
+/**
+ * Создаёт одноразовую ссылку-приглашение (живёт 7 дней) и пытается отправить её на почту
+ * через Resend. Если email-сервис не настроен или письмо не ушло — не делаем вид, что всё
+ * получилось: возвращаем саму ссылку, чтобы админ мог передать её вручную.
+ */
+async function issueInvite(userId: string, email: string, name: string) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+  await prisma.inviteToken.create({ data: { userId, token, expiresAt } });
+  const link = `${baseUrl()}/invite/${token}`;
+  const result = await sendEmail({ to: email, subject: 'Доступ к панели аналитики', html: inviteEmailHtml({ name, link }) });
+  return { link, result };
+}
 
 export const dynamic = 'force-dynamic';
 
@@ -26,14 +46,62 @@ async function createUserAction(formData: FormData) {
   const email = String(formData.get('email') || '').trim().toLowerCase();
   const name = String(formData.get('name') || '').trim();
   const role = String(formData.get('role') || 'CLIENT');
-  const password = String(formData.get('password') || '');
-  if (!email || !name || password.length < 8) return;
-  const passwordHash = await bcrypt.hash(password, 10);
-  await prisma.user.create({ data: { email, name, role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT', passwordHash } });
+  if (!email || !name) return;
+
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) {
+    redirect(`/settings?inviteError=${encodeURIComponent('Пользователь с таким email уже есть.')}`);
+  }
+
+  // Пароль никто не вводит и не видит — случайная строка только для того, чтобы поле было
+  // непустым. Войти можно только через ссылку из письма, где пользователь сам задаёт пароль.
+  const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  const user = await prisma.user.create({ data: { email, name, role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT', passwordHash } });
   await prisma.activityLog.create({
     data: { actorId: admin.id, actorName: admin.name, action: 'user.create', targetType: 'User', targetId: email, meta: { role, name } },
   });
+
+  const { link, result } = await issueInvite(user.id, email, name);
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.invite',
+      targetType: 'User',
+      targetId: user.id,
+      meta: { email, emailSent: result.ok, emailMessage: result.message },
+    },
+  });
   revalidatePath('/settings');
+  if (!result.ok) {
+    redirect(`/settings?inviteLink=${encodeURIComponent(link)}&inviteEmail=${encodeURIComponent(email)}`);
+  }
+}
+
+async function resendInviteAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const userId = String(formData.get('userId') || '');
+  if (!userId) return;
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  if (target.inviteAcceptedAt) return;
+
+  const { link, result } = await issueInvite(target.id, target.email, target.name);
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.reinvite',
+      targetType: 'User',
+      targetId: userId,
+      meta: { email: target.email, emailSent: result.ok, emailMessage: result.message },
+    },
+  });
+  revalidatePath('/settings');
+  if (!result.ok) {
+    redirect(`/settings?inviteLink=${encodeURIComponent(link)}&inviteEmail=${encodeURIComponent(target.email)}`);
+  }
 }
 
 async function deleteUserAction(formData: FormData) {
@@ -122,7 +190,11 @@ async function testAiProviderAction(formData: FormData) {
   revalidatePath('/settings');
 }
 
-export default async function SettingsPage() {
+export default async function SettingsPage({
+  searchParams,
+}: {
+  searchParams: { inviteLink?: string; inviteEmail?: string; inviteError?: string };
+}) {
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') redirect('/dashboard');
 
@@ -132,6 +204,23 @@ export default async function SettingsPage() {
 
   return (
     <div>
+      {searchParams.inviteError && (
+        <div className="panel" style={{ borderColor: 'var(--bad)' }}>
+          <div style={{ color: 'var(--bad)', fontWeight: 600 }}>{searchParams.inviteError}</div>
+        </div>
+      )}
+      {searchParams.inviteLink && (
+        <div className="panel">
+          <h2>Ссылка-приглашение для {searchParams.inviteEmail}</h2>
+          <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 10 }}>
+            Письмо отправить не удалось (см. историю действий ниже — там причина) — передайте ссылку вручную, она
+            действует 7 дней:
+          </p>
+          <code style={{ display: 'block', padding: '8px 10px', background: 'var(--bg-muted, #f4f4f5)', borderRadius: 6, wordBreak: 'break-all', fontSize: 12.5 }}>
+            {searchParams.inviteLink}
+          </code>
+        </div>
+      )}
       <div className="panel">
         <h2>Настройки → ИИ</h2>
         <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
@@ -197,6 +286,7 @@ export default async function SettingsPage() {
               <th>Имя</th>
               <th>Email</th>
               <th>Роль</th>
+              <th>Статус</th>
               <th>Создан</th>
               <th></th>
             </tr>
@@ -207,6 +297,23 @@ export default async function SettingsPage() {
                 <td>{u.name}</td>
                 <td>{u.email}</td>
                 <td>{ROLE_LABEL[u.role] ?? u.role}</td>
+                <td>
+                  {u.inviteAcceptedAt ? (
+                    <span className="pill ok">Активен</span>
+                  ) : (
+                    <div>
+                      <span className="pill warning" style={{ marginBottom: 4, display: 'inline-block' }}>
+                        Ждёт входа по ссылке
+                      </span>
+                      <form action={resendInviteAction}>
+                        <input type="hidden" name="userId" value={u.id} />
+                        <button className="btn" style={{ padding: '2px 8px', fontSize: 11 }} type="submit">
+                          Отправить ссылку ещё раз
+                        </button>
+                      </form>
+                    </div>
+                  )}
+                </td>
                 <td>{u.createdAt.toLocaleDateString('ru-RU')}</td>
                 <td>
                   {u.id === user.id ? (
@@ -226,21 +333,21 @@ export default async function SettingsPage() {
         </table>
         <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: 10 }}>
           Удаление отзывает у пользователя все назначения на проекты и вход в систему; последнего главного
-          администратора удалить нельзя.
+          администратора удалить нельзя. Пароль никто не вводит — при создании на почту уходит ссылка, по которой
+          человек сам задаёт себе пароль и получает доступ.
         </p>
 
         <h3>Добавить пользователя</h3>
         <form action={createUserAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
           <input type="text" name="name" placeholder="Имя" required />
           <input type="email" name="email" placeholder="Email" required />
-          <input type="password" name="password" placeholder="Пароль (мин. 8 символов)" required minLength={8} />
           <select name="role" defaultValue="MANAGER">
             <option value="MANAGER">Менеджер</option>
             <option value="CLIENT">Продавец</option>
             <option value="SUPER_ADMIN">Главный администратор</option>
           </select>
           <button className="btn btn-primary" type="submit">
-            Создать
+            Создать и отправить приглашение
           </button>
         </form>
       </div>

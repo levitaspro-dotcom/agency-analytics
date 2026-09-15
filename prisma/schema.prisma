@@ -32,11 +32,29 @@ model User {
   passwordHash      String
   name              String
   role              UserRole
+  /// Когда пользователь сам задал пароль по ссылке из письма-приглашения. Пусто — приглашение
+  /// отправлено, но ещё не принято (пароль случайный, никому не известен и вход невозможен).
+  inviteAcceptedAt  DateTime?
   createdAt         DateTime            @default(now())
   assignments       ProjectAssignment[]
   activity          ActivityLog[]
   aiMessages        AiMessage[]
   aiRecommendations AiRecommendation[]
+  inviteTokens      InviteToken[]
+}
+
+/// Одноразовая ссылка-приглашение для первого входа: пользователь создаётся с заведомо
+/// случайным паролем (никто его не знает), переходит по ссылке из письма и задаёт пароль сам.
+model InviteToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
 }
 
 model Client {
