@@ -143,17 +143,25 @@ async function fetchPostingNumbers(creds: OzonCredentials, dateFrom: Date, dateT
   return { postingNumbers: [...postingNumbers], errors };
 }
 
-/** Ищет массив операций в ответе — формат ответа у нового метода не задокументирован публично на 100%, поэтому проверяем несколько вероятных мест. */
-function extractOperationsArray(json: any): any[] | null {
-  const candidates = [
-    json?.result,
-    json?.result?.operations,
-    json?.result?.postings,
-    json?.result?.items,
-    json?.postings,
-    json?.operations,
-    json?.items,
-  ];
+/**
+ * Реальный формат ответа /v1/finance/accrual/postings (подтверждён по фактическому
+ * ответу Ozon, не по документации — публичного описания на момент написания не было):
+ *
+ *   { "posting_accruals": [
+ *       { "posting_number": "15156597-0481-1",
+ *         "accruals": [
+ *           { "type_id": 38, "accrued": { "amount": "-5", "currency": "RUB" },
+ *             "accrual_date": "2026-09-09", "seller_price": null, "sku": 4775166327, "quantity": 1 },
+ *           ...
+ *         ] },
+ *       ...
+ *   ] }
+ *
+ * Оставляем немного альтернативных мест на случай, если Ozon поменяет обёртку без
+ * изменения внутренней структуры.
+ */
+function extractPostingAccruals(json: any): any[] | null {
+  const candidates = [json?.posting_accruals, json?.result?.posting_accruals, json?.result, json?.postings, json?.result?.postings];
   for (const c of candidates) {
     if (Array.isArray(c)) return c;
   }
@@ -169,19 +177,69 @@ function shortJsonPreview(json: any): string {
   }
 }
 
-/** Приводит «сырую» запись из ответа Ozon к нашему внутреннему формату, независимо от точных имён полей нового метода. */
-function normalizeOperation(raw: any): OzonOperation | null {
-  if (!raw || typeof raw !== 'object') return null;
-  const operation_date = raw.operation_date ?? raw.date ?? raw.accrual_date;
-  if (!operation_date) return null;
-  const operation_type = raw.operation_type ?? raw.type ?? 'unknown';
-  const operation_id =
-    raw.operation_id ?? raw.id ?? `${raw.posting_number ?? ''}:${operation_type}:${operation_date}`;
-  const operation_type_name = raw.operation_type_name ?? raw.type_name ?? operation_type;
-  const accruals_for_sale = Number(raw.accruals_for_sale ?? raw.accrual_amount ?? 0) || 0;
-  const amount = Number(raw.amount ?? raw.total_amount ?? raw.sum ?? 0) || 0;
-  const sale_commission = raw.sale_commission !== undefined ? Number(raw.sale_commission) : undefined;
-  return { operation_id, operation_type, operation_type_name, operation_date, accruals_for_sale, amount, sale_commission };
+/**
+ * Справочник названий типов начислений (/v1/finance/accrual/types). Лучшее из
+ * возможного: если запрос не удастся или формат окажется иным — просто покажем
+ * числовой код типа вместо названия, на деньгах это никак не сказывается.
+ */
+async function fetchAccrualTypeNames(creds: OzonCredentials): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  try {
+    const { ok, json } = await ozonFetch(creds, '/v1/finance/accrual/types', {});
+    if (!ok) return map;
+    const candidates = [json?.result, json?.result?.types, json?.types, json?.accrual_types];
+    let list: any[] | null = null;
+    for (const c of candidates) {
+      if (Array.isArray(c)) {
+        list = c;
+        break;
+      }
+    }
+    if (!list) return map;
+    for (const t of list) {
+      const id = t?.type_id ?? t?.id;
+      const name = t?.name ?? t?.title ?? t?.type_name;
+      if (id !== undefined && id !== null && name) map.set(Number(id), String(name));
+    }
+  } catch {
+    // не критично — работаем дальше с числовыми кодами
+  }
+  return map;
+}
+
+/**
+ * Разворачивает вложенную структуру (отправление -> список начислений) в плоский
+ * список операций нашего внутреннего формата. Каждая строка начисления Ozon уже
+ * содержит один знаковый (+/-) итог, поэтому категоризация «выручка / комиссия»
+ * делается по знаку: положительное начисление — доход, отрицательное — расход
+ * (совпадает по смыслу с прежней логикой accrual/net/fee на стороне вызывающего кода).
+ */
+function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, string>): OzonOperation[] {
+  const rows: OzonOperation[] = [];
+  for (const posting of postingAccruals) {
+    if (!posting || typeof posting !== 'object') continue;
+    const postingNumber = posting.posting_number ?? '';
+    const accruals: any[] = Array.isArray(posting.accruals) ? posting.accruals : [];
+    for (const a of accruals) {
+      if (!a || typeof a !== 'object') continue;
+      const operation_date = a.accrual_date ?? a.date;
+      if (!operation_date) continue;
+      const typeId = a.type_id;
+      const amountRaw = a.accrued?.amount ?? a.amount;
+      const amount = Number(amountRaw) || 0;
+      const operation_type_name =
+        (typeId !== undefined && typeNames.get(Number(typeId))) || `Тип начисления ${typeId ?? '?'}`;
+      rows.push({
+        operation_id: `${postingNumber}:${typeId ?? ''}:${operation_date}:${a.sku ?? ''}`,
+        operation_type: String(typeId ?? 'unknown'),
+        operation_type_name,
+        operation_date,
+        accruals_for_sale: amount > 0 ? amount : 0,
+        amount,
+      });
+    }
+  }
+  return rows;
 }
 
 /**
@@ -215,8 +273,9 @@ export async function fetchOzonFinanceTransactions(
     return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations };
   }
 
+  const typeNames = await fetchAccrualTypeNames(creds);
   let unrecognizedSample: string | null = null;
-  let rawItemsSeen = 0;
+  let postingsWithAccrualsSeen = 0;
 
   for (const batch of chunkArray(postingNumbers, 200)) {
     const { ok, status, json } = await ozonFetch(creds, '/v1/finance/accrual/postings', {
@@ -225,28 +284,22 @@ export async function fetchOzonFinanceTransactions(
     if (!ok) {
       return { ok: false, message: ozonErrorMessage(status, json), operations };
     }
-    const rawList = extractOperationsArray(json);
-    if (rawList === null) {
+    const postingAccruals = extractPostingAccruals(json);
+    if (postingAccruals === null) {
       if (!unrecognizedSample) unrecognizedSample = shortJsonPreview(json);
       continue;
     }
-    rawItemsSeen += rawList.length;
-    for (const raw of rawList) {
-      const normalized = normalizeOperation(raw);
-      if (normalized) operations.push(normalized);
-      else if (!unrecognizedSample && raw && typeof raw === 'object') {
-        // Нашли массив, но не смогли распознать в его элементах ни одной операции —
-        // вероятно, элементы вложенные (например, начисления сгруппированы по
-        // отправлению), а не плоский список операций. Не подставляем тихо 0 — фиксируем пример.
-        unrecognizedSample = shortJsonPreview({ note: 'элемент массива не распознан как операция', item: raw });
-      }
-    }
+    postingsWithAccrualsSeen += postingAccruals.length;
+    operations.push(...flattenPostingAccruals(postingAccruals, typeNames));
   }
 
-  if (rawItemsSeen > 0 && operations.length === 0 && unrecognizedSample) {
+  if (postingsWithAccrualsSeen > 0 && operations.length === 0 && !unrecognizedSample) {
+    // Массив отправлений распознан, но ни в одном не нашлось строк начислений —
+    // либо у этих отправлений правда ещё нет начислений, либо формат вложенных
+    // accruals[] изменился. Не показываем тихий ноль — просим прислать пример.
     return {
       ok: false,
-      message: `Ozon вернул данные (${rawItemsSeen} элементов), но их формат не распознан — нужна донастройка интеграции. Отправлений найдено: ${postingNumbers.length}. Пример элемента: ${unrecognizedSample}`,
+      message: `Получено ${postingsWithAccrualsSeen} отправлений (из ${postingNumbers.length} за период), но ни одной строки начисления в них не найдено — возможно, формат вложенного accruals[] изменился. Нужна проверка.`,
       operations,
     };
   }
@@ -260,5 +313,9 @@ export async function fetchOzonFinanceTransactions(
   }
 
   const notePosting = postingErrors.length > 0 ? ` (не удалось проверить часть отправлений: ${postingErrors.join('; ')})` : '';
-  return { ok: true, message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}`, operations };
+  return {
+    ok: true,
+    message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}`,
+    operations,
+  };
 }
