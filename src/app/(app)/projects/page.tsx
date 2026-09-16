@@ -603,6 +603,7 @@ async function syncStoreAction(formData: FormData) {
       type: 'REVENUE' | 'OZON_FEE' | 'COGS';
       category: string;
       amount: number;
+      quantity?: number;
       date: Date;
       externalId: string;
     }[] = [];
@@ -625,6 +626,7 @@ async function syncStoreAction(formData: FormData) {
         type: 'REVENUE',
         category: 'Продажи Ozon',
         amount: revenue,
+        quantity: line.quantity,
         date,
         externalId: `${line.postingNumber}:${lineKey ?? 'x'}:revenue`,
       });

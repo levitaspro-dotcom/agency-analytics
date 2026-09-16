@@ -83,12 +83,52 @@ export async function computeFinanceSummary(params: {
   return { revenue, ozonFees, cogs, externalExpenses, taxes, totalExpenses, profit, margin, byType, taxRatePercent };
 }
 
+/**
+ * Ozon-категории расходов (OZON_FEE.category — как их называет сам Ozon в ответе
+ * /v1/finance/accrual/types, иногда без перевода на русский) раскладываем в несколько
+ * понятных групп для страницы «Товары». Это только группировка для отображения —
+ * полный список исходных категорий по-прежнему виден на странице «Расходы».
+ * Категории, которых Ozon пока не отдаёт через это API (реклама — отдельный Performance
+ * API с другими ключами; хранение и эквайринг в текущих данных ни разу не встречались —
+ * либо их нет у этих магазинов, либо нужен другой отчёт Ozon), сюда не включены.
+ */
+const FEE_BUCKET_BY_CATEGORY: Record<string, 'commission' | 'logistics' | 'handling'> = {
+  SaleCommission: 'commission',
+  BrandCommission: 'commission',
+  Logistic: 'logistics',
+  LastMileCourier: 'logistics',
+  ReturnFlowLogistic: 'logistics',
+  'Drop-Off Agent': 'logistics',
+  DeliveryToHandoverPlaceByOzon: 'logistics',
+  PackingFee: 'handling',
+  PackageCost: 'handling',
+  PickUpPointReturnAcceptance: 'handling',
+};
+
+function bucketFeeCategory(category: string): 'commission' | 'logistics' | 'handling' | 'other' {
+  return FEE_BUCKET_BY_CATEGORY[category] ?? 'other';
+}
+
 export interface ProductInsight {
   id: string;
   name: string;
   sku: string;
+  /** Товар есть в текущем каталоге Ozon этого магазина (не путать с «были продажи за период» ниже). */
+  active: boolean;
+  /** Продано штук за период — из состава заказа (posting.products[]), 0 — значит заказов не было. */
+  quantitySold: number;
   revenue: number;
   cogsFromTx: number;
+  /** Комиссия Ozon за продажу и за бренд. */
+  commissionFee: number;
+  /** Логистика, последняя миля, логистика возврата, доставка/приём в пункте. */
+  logisticsFee: number;
+  /** Упаковка и обработка отправления (в т.ч. приём возврата в ПВЗ). */
+  handlingFee: number;
+  /** Прочие сборы Ozon, не попавшие в три группы выше (например, рассрочка). */
+  otherFee: number;
+  /** Сумма всех расходов по товару за период: себестоимость + все сборы Ozon. */
+  totalExpenses: number;
   /** null, если себестоимость ещё не введена — тогда маржу с единицы посчитать честно нельзя (не показываем в этом случае мнимые 100%). */
   unitMargin: number | null;
   periodProfit: number;
@@ -111,25 +151,46 @@ export async function computeProductInsights(params: {
   const txs = productIds.length
     ? await prisma.financeTransaction.findMany({
         where: { projectId, productId: { in: productIds }, date: { gte: from, lte: to } },
-        select: { productId: true, type: true, amount: true },
+        select: { productId: true, type: true, amount: true, category: true, quantity: true },
       })
     : [];
 
   const revByProduct = new Map<string, number>();
   const cogsByProduct = new Map<string, number>();
+  const qtyByProduct = new Map<string, number>();
+  const feeByProduct = new Map<string, { commission: number; logistics: number; handling: number; other: number }>();
+  const feeRow = (id: string) => {
+    let row = feeByProduct.get(id);
+    if (!row) {
+      row = { commission: 0, logistics: 0, handling: 0, other: 0 };
+      feeByProduct.set(id, row);
+    }
+    return row;
+  };
   for (const t of txs) {
     if (!t.productId) continue;
-    if (t.type === 'REVENUE') revByProduct.set(t.productId, (revByProduct.get(t.productId) ?? 0) + t.amount);
+    if (t.type === 'REVENUE') {
+      revByProduct.set(t.productId, (revByProduct.get(t.productId) ?? 0) + t.amount);
+      if (t.quantity) qtyByProduct.set(t.productId, (qtyByProduct.get(t.productId) ?? 0) + t.quantity);
+    }
     if (t.type === 'COGS') cogsByProduct.set(t.productId, (cogsByProduct.get(t.productId) ?? 0) + t.amount);
+    if (t.type === 'OZON_FEE') {
+      const row = feeRow(t.productId);
+      row[bucketFeeCategory(t.category)] += t.amount;
+    }
   }
 
   return products
     .map((p) => {
       const revenue = revByProduct.get(p.id) ?? 0;
       const cogsFromTx = cogsByProduct.get(p.id) ?? 0;
+      const quantitySold = qtyByProduct.get(p.id) ?? 0;
+      const fees = feeByProduct.get(p.id) ?? { commission: 0, logistics: 0, handling: 0, other: 0 };
+      const totalFees = fees.commission + fees.logistics + fees.handling + fees.other;
+      const totalExpenses = cogsFromTx + totalFees;
       const costKnown = p.costPrice > 0;
       const unitMargin = costKnown && p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : null;
-      const periodProfit = revenue - cogsFromTx;
+      const periodProfit = revenue - totalExpenses;
       let flag: 'critical' | 'warning' | null = null;
       let reason: string | undefined;
       if (!costKnown) {
@@ -139,15 +200,32 @@ export async function computeProductInsights(params: {
         reason = 'Себестоимость не указана — маржа с единицы не может быть посчитана';
       } else if (revenue > 0 && periodProfit < 0) {
         flag = 'critical';
-        reason = 'Убыток за период: расходы на товар превышают выручку по нему';
+        reason = 'Убыток за период: расходы на товар (себестоимость + сборы Ozon) превышают выручку по нему';
       } else if (unitMargin !== null && unitMargin < 0.1) {
         flag = 'warning';
         reason = `Маржа с единицы всего ${(unitMargin * 100).toFixed(1)}%`;
-      } else if (revenue === 0 && cogsFromTx > 0) {
+      } else if (revenue === 0 && totalExpenses > 0) {
         flag = 'warning';
         reason = 'Есть расходы по товару без выручки за период';
       }
-      return { id: p.id, name: p.name, sku: p.sku, revenue, cogsFromTx, unitMargin, periodProfit, flag, reason };
+      return {
+        id: p.id,
+        name: p.name,
+        sku: p.sku,
+        active: p.active,
+        quantitySold,
+        revenue,
+        cogsFromTx,
+        commissionFee: fees.commission,
+        logisticsFee: fees.logistics,
+        handlingFee: fees.handling,
+        otherFee: fees.other,
+        totalExpenses,
+        unitMargin,
+        periodProfit,
+        flag,
+        reason,
+      };
     })
     .sort((a, b) => (a.flag ? 0 : 1) - (b.flag ? 0 : 1) || a.periodProfit - b.periodProfit);
 }

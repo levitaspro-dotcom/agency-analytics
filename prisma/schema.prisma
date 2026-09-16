@@ -167,6 +167,12 @@ model FinanceTransaction {
   type        TransactionType
   category    String
   amount      Float
+  /// Количество единиц товара в этой операции — заполняется только у REVENUE-строк,
+  /// пришедших из состава заказа (posting.products[]), чтобы на странице «Товары»
+  /// можно было показать «продано штук» за период. У расходных строк Ozon (OZON_FEE)
+  /// своё количество тоже иногда есть в начислении, но для суммарного «продано» по
+  /// товару используем именно строки выручки — они не дублируются на возврат/логистику.
+  quantity    Int?
   date        DateTime
   description String?
   externalId  String?
