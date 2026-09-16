@@ -3,7 +3,7 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: 'Агентство · Аналитика',
-  description: 'Финансовая аналитика и ИИ-аудит для проектов агентства',
+  description: 'Финансовая аналитика и ИИ-аудит для магазинов агентства',
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

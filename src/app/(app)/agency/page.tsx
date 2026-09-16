@@ -63,19 +63,19 @@ export default async function AgencyOverviewPage({
       </form>
 
       <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -14, marginBottom: 20 }}>
-        Сводка по всем продавцам и проектам агентства за {formatDate(from)} – {formatDate(to)}. Как главный
-        администратор вы видите здесь все текущие и будущие проекты автоматически — без ручного назначения.
+        Сводка по всем продавцам и магазинам агентства за {formatDate(from)} – {formatDate(to)}. Как главный
+        администратор вы видите здесь все текущие и будущие магазины автоматически — без ручного назначения.
       </p>
 
       {projects.length === 0 ? (
-        <div className="empty-state">Проектов пока нет — создайте первый в разделе «Проекты».</div>
+        <div className="empty-state">Магазинов пока нет — создайте первый в разделе «Магазины».</div>
       ) : (
         <>
           <div className="kpi-grid">
             <div className="kpi-card">
               <div className="kpi-label">Выручка по агентству</div>
               <div className="kpi-value">{money(totals.revenue)}</div>
-              <div className="kpi-sub">{rows.length} проектов за период</div>
+              <div className="kpi-sub">{rows.length} магазинов за период</div>
             </div>
             <div className="kpi-card">
               <div className="kpi-label">Все расходы</div>
@@ -90,21 +90,21 @@ export default async function AgencyOverviewPage({
               <div className="kpi-label">Требуют внимания</div>
               <div className="kpi-value">{lossCount}</div>
               <div className="kpi-sub">
-                проектов в убытке{staleCount > 0 ? ` · ${staleCount} с устаревшими данными` : ''}
+                магазинов в убытке{staleCount > 0 ? ` · ${staleCount} с устаревшими данными` : ''}
               </div>
             </div>
           </div>
 
           <div className="panel">
-            <h2>Проекты</h2>
+            <h2>Магазины</h2>
             <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: -8, marginBottom: 14 }}>
-              Сначала — проекты с наименьшей прибылью за период.
+              Сначала — магазины с наименьшей прибылью за период.
             </p>
             <table className="data-table">
               <thead>
                 <tr>
                   <th>Продавец</th>
-                  <th>Проект</th>
+                  <th>Магазин</th>
                   <th>Выручка</th>
                   <th>Расходы</th>
                   <th>Прибыль</th>

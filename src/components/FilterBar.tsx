@@ -27,22 +27,11 @@ export function FilterBar({
   return (
     <form method="get" action={basePath} className="topbar">
       <div className="field">
-        <label>Проект</label>
+        <label>Магазин</label>
         <select name="projectId" defaultValue={selected?.id}>
           {projects.map((p) => (
             <option key={p.id} value={p.id}>
               {p.client.name} · {p.name}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="field">
-        <label>Магазин</label>
-        <select name="storeId" defaultValue={selectedStoreId ?? ''}>
-          <option value="">Все магазины проекта</option>
-          {selected?.stores.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.name}
             </option>
           ))}
         </select>

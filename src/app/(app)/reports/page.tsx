@@ -40,7 +40,7 @@ export default async function ReportsPage({
   const projects = await listAccessibleProjects(user);
 
   if (projects.length === 0) {
-    return <div className="empty-state">У вас пока нет доступных проектов. Обратитесь к администратору.</div>;
+    return <div className="empty-state">У вас пока нет доступных магазинов. Обратитесь к администратору.</div>;
   }
 
   const projectId = searchParams.projectId && projects.some((p) => p.id === searchParams.projectId) ? searchParams.projectId : projects[0].id;
@@ -89,7 +89,7 @@ export default async function ReportsPage({
         </h2>
         <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
           Период: {formatDate(from)} – {formatDate(to)}
-          {storeName ? ` · магазин: ${storeName}` : ' · все магазины проекта'}
+          {storeName ? ` · подключение: ${storeName}` : ''}
         </p>
 
         <div className="kpi-grid">

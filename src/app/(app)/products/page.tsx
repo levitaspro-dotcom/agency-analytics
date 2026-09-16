@@ -14,7 +14,7 @@ export default async function ProductsPage({
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
-  if (projects.length === 0) return <div className="empty-state">Нет доступных проектов.</div>;
+  if (projects.length === 0) return <div className="empty-state">Нет доступных магазинов.</div>;
 
   const projectId = searchParams.projectId && projects.some((p) => p.id === searchParams.projectId) ? searchParams.projectId : projects[0].id;
   await assertProjectAccess(user, projectId);
@@ -37,8 +37,8 @@ export default async function ProductsPage({
         <h2>Товары за период</h2>
         {products.length === 0 ? (
           <div className="empty-state">
-            В проекте пока нет товаров. Они появятся здесь автоматически после синхронизации магазина Ozon
-            (раздел «Проекты» → «Синхронизировать»).
+            В этом магазине пока нет товаров. Они появятся здесь автоматически после синхронизации
+            (раздел «Магазины» → «Синхронизировать»).
           </div>
         ) : (
           <>

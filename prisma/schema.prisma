@@ -26,6 +26,14 @@ enum AiProvider {
   OPENAI
 }
 
+/// Площадка, на которой торгует магазин. Сейчас реально подключается только Ozon
+/// (см. поля ozon* в Store) — Wildberries пока просто отмечается как площадка на будущее,
+/// без реальной интеграции.
+enum Marketplace {
+  OZON
+  WILDBERRIES
+}
+
 model User {
   id                String              @id @default(cuid())
   email             String              @unique
@@ -69,6 +77,9 @@ model Project {
   clientId          String
   client            Client                @relation(fields: [clientId], references: [id])
   name              String
+  /// Площадка магазина (Ozon сейчас, Wildberries — на будущее). Не влияет на синхронизацию,
+  /// только отображается как метка — реальное подключение к Wildberries появится позже.
+  marketplace       Marketplace           @default(OZON)
   /// Ставка налога в процентах от выручки (например 6 для УСН «Доходы» 6%). 0/не задано — налог не считается автоматически. Задаётся вручную, синхронизация её не трогает.
   taxRatePercent    Float                 @default(0)
   createdAt         DateTime              @default(now())

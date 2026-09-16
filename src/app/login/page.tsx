@@ -31,7 +31,7 @@ function LoginForm() {
     <div className="login-wrap">
       <div className="login-card">
         <h1>Вход в систему</h1>
-        <p className="sub">Аналитика и ИИ-аудит для проектов агентства</p>
+        <p className="sub">Аналитика и ИИ-аудит для магазинов агентства</p>
         {welcome && (
           <div className="sub" style={{ color: 'var(--ok, #16a34a)' }}>
             Пароль задан — теперь можно войти.

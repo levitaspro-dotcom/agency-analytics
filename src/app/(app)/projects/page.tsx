@@ -7,6 +7,11 @@ import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, ty
 
 export const dynamic = 'force-dynamic';
 
+const MARKETPLACE_LABEL: Record<string, string> = {
+  OZON: 'Ozon',
+  WILDBERRIES: 'Wildberries',
+};
+
 async function createClientAction(formData: FormData) {
   'use server';
   const user = await requireUser();
@@ -20,16 +25,33 @@ async function createClientAction(formData: FormData) {
   revalidatePath('/projects');
 }
 
-async function createProjectAction(formData: FormData) {
+// Магазин — это продавец-проект (Project) вместе с его единственным подключением к площадке
+// (Store): и то, и другое создаётся/переименовывается вместе, чтобы для пользователя это была
+// одна сущность, а не два вложенных уровня.
+async function createShopAction(formData: FormData) {
   'use server';
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
   const clientId = String(formData.get('clientId') || '');
   const name = String(formData.get('name') || '').trim();
+  const marketplaceRaw = String(formData.get('marketplace') || 'OZON');
+  const marketplace = marketplaceRaw === 'WILDBERRIES' ? 'WILDBERRIES' : 'OZON';
+  const ozonClientId = String(formData.get('ozonClientId') || '').trim();
+  const ozonApiKey = String(formData.get('ozonApiKey') || '').trim();
   if (!clientId || !name) return;
-  const project = await prisma.project.create({ data: { clientId, name } });
+
+  const project = await prisma.project.create({ data: { clientId, name, marketplace } });
+  await prisma.store.create({
+    data: {
+      projectId: project.id,
+      name,
+      ozonClientId: ozonClientId || null,
+      ozonApiKeyEncrypted: ozonApiKey ? encryptSecret(ozonApiKey) : null,
+      ozonApiKeyLast4: ozonApiKey ? last4(ozonApiKey) : null,
+    },
+  });
   await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'project.create', targetType: 'Project', targetId: project.id, meta: { name } },
+    data: { actorId: user.id, actorName: user.name, action: 'shop.create', targetType: 'Project', targetId: project.id, meta: { name, marketplace } },
   });
   revalidatePath('/projects');
 }
@@ -80,9 +102,9 @@ async function deleteClientAction(formData: FormData) {
   const projects = await prisma.project.findMany({ where: { clientId }, select: { id: true } });
   const projectIds = projects.map((p) => p.id);
 
-  // Удаление продавца необратимо и удаляет вместе с ним все его проекты и всё, что было
-  // загружено по ним (магазины, товары, финансовые операции) — как и при удалении
-  // отдельного проекта или магазина, чтобы не оставалось «осиротевших» данных.
+  // Удаление продавца необратимо и удаляет вместе с ним все его магазины и всё, что было
+  // загружено по ним (подключения к площадкам, товары, финансовые операции) — как и при
+  // удалении отдельного магазина, чтобы не оставалось «осиротевших» данных.
   await prisma.$transaction([
     prisma.financeTransaction.deleteMany({ where: { projectId: { in: projectIds } } }),
     prisma.product.deleteMany({ where: { projectId: { in: projectIds } } }),
@@ -98,7 +120,7 @@ async function deleteClientAction(formData: FormData) {
       action: 'client.delete',
       targetType: 'Client',
       targetId: clientId,
-      meta: { name: client.name, projectsDeleted: projectIds.length },
+      meta: { name: client.name, shopsDeleted: projectIds.length },
     },
   });
   revalidatePath('/projects');
@@ -106,22 +128,69 @@ async function deleteClientAction(formData: FormData) {
   revalidatePath('/dashboard');
 }
 
-async function renameProjectAction(formData: FormData) {
+async function renameShopAction(formData: FormData) {
   'use server';
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
   const projectId = String(formData.get('projectId') || '');
   const name = String(formData.get('name') || '').trim();
   if (!projectId || !name) return;
-  await prisma.project.update({ where: { id: projectId }, data: { name } });
+  await prisma.$transaction([
+    prisma.project.update({ where: { id: projectId }, data: { name } }),
+    // Название подключения (Store) держим синхронным с названием магазина — отдельно
+    // пользователь его больше не видит и не редактирует.
+    prisma.store.updateMany({ where: { projectId }, data: { name } }),
+  ]);
   await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'project.rename', targetType: 'Project', targetId: projectId, meta: { name } },
+    data: { actorId: user.id, actorName: user.name, action: 'shop.rename', targetType: 'Project', targetId: projectId, meta: { name } },
   });
   revalidatePath('/projects');
   revalidatePath('/agency');
 }
 
-async function deleteProjectAction(formData: FormData) {
+async function changeShopMarketplaceAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  const marketplaceRaw = String(formData.get('marketplace') || '');
+  if (!projectId || (marketplaceRaw !== 'OZON' && marketplaceRaw !== 'WILDBERRIES')) return;
+
+  await prisma.project.update({ where: { id: projectId }, data: { marketplace: marketplaceRaw } });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'shop.setMarketplace', targetType: 'Project', targetId: projectId, meta: { marketplace: marketplaceRaw } },
+  });
+  revalidatePath('/projects');
+}
+
+// «Заменить продавца» — перенести магазин к другому продавцу (например, если завели его не
+// под тем клиентом или бизнес перешёл к другому юрлицу).
+async function changeShopOwnerAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const projectId = String(formData.get('projectId') || '');
+  const clientId = String(formData.get('clientId') || '');
+  if (!projectId || !clientId) return;
+  const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
+  if (project.clientId === clientId) return;
+
+  await prisma.project.update({ where: { id: projectId }, data: { clientId } });
+  await prisma.activityLog.create({
+    data: {
+      actorId: user.id,
+      actorName: user.name,
+      action: 'shop.changeOwner',
+      targetType: 'Project',
+      targetId: projectId,
+      meta: { fromClientId: project.clientId, toClientId: clientId },
+    },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/agency');
+}
+
+async function deleteShopAction(formData: FormData) {
   'use server';
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
@@ -129,10 +198,9 @@ async function deleteProjectAction(formData: FormData) {
   if (!projectId) return;
   const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
 
-  // Как и удаление магазина/продавца — необратимо: вместе с проектом удаляются все его
-  // магазины, товары и финансовые операции, чтобы не оставалось «осиротевших» данных.
-  // Назначения пользователей, сообщения ИИ-аналитика и рекомендации по проекту удаляются
-  // автоматически на уровне базы (каскад по внешнему ключу).
+  // Необратимо: вместе с магазином удаляются его подключение к площадке, товары и финансовые
+  // операции, чтобы не оставалось «осиротевших» данных. Назначения пользователей, сообщения
+  // ИИ-аналитика и рекомендации по магазину удаляются автоматически на уровне базы (каскад).
   await prisma.$transaction([
     prisma.financeTransaction.deleteMany({ where: { projectId } }),
     prisma.product.deleteMany({ where: { projectId } }),
@@ -141,7 +209,7 @@ async function deleteProjectAction(formData: FormData) {
   ]);
 
   await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'project.delete', targetType: 'Project', targetId: projectId, meta: { name: project.name } },
+    data: { actorId: user.id, actorName: user.name, action: 'shop.delete', targetType: 'Project', targetId: projectId, meta: { name: project.name } },
   });
   revalidatePath('/projects');
   revalidatePath('/agency');
@@ -179,28 +247,44 @@ async function removeAssignmentAction(formData: FormData) {
   revalidatePath('/projects');
 }
 
-async function addStoreAction(formData: FormData) {
+// Редактирование Client-Id/Api-Key в существующем подключении, без удаления магазина.
+// Api-Key необязателен — если оставить поле пустым, прежний ключ сохраняется (перезаписывается
+// только Client-Id). Если у магазина ещё нет подключения (Store), оно создаётся здесь же.
+async function updateShopCredsAction(formData: FormData) {
   'use server';
   const user = await requireUser();
   if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
   const projectId = String(formData.get('projectId') || '');
-  const name = String(formData.get('name') || '').trim();
   const ozonClientId = String(formData.get('ozonClientId') || '').trim();
   const ozonApiKey = String(formData.get('ozonApiKey') || '').trim();
-  if (!projectId || !name) return;
+  if (!projectId) return;
   await assertProjectAccess(user, projectId);
 
-  const store = await prisma.store.create({
-    data: {
-      projectId,
-      name,
-      ozonClientId: ozonClientId || null,
-      ozonApiKeyEncrypted: ozonApiKey ? encryptSecret(ozonApiKey) : null,
-      ozonApiKeyLast4: ozonApiKey ? last4(ozonApiKey) : null,
-    },
-  });
+  const store = await prisma.store.findFirst({ where: { projectId } });
+  const keyData = ozonApiKey ? { ozonApiKeyEncrypted: encryptSecret(ozonApiKey), ozonApiKeyLast4: last4(ozonApiKey) } : {};
+
+  if (store) {
+    await prisma.store.update({
+      where: { id: store.id },
+      data: {
+        ozonClientId: ozonClientId || null,
+        ...keyData,
+        // Прежние результаты проверки/синхронизации относились к старым данным подключения —
+        // после изменения Client-Id/Api-Key они уже не показательны.
+        lastTestAt: null,
+        lastTestOk: null,
+        lastTestMessage: null,
+      },
+    });
+  } else {
+    const project = await prisma.project.findUniqueOrThrow({ where: { id: projectId } });
+    await prisma.store.create({
+      data: { projectId, name: project.name, ozonClientId: ozonClientId || null, ...keyData },
+    });
+  }
+
   await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'store.create', targetType: 'Store', targetId: store.id, meta: { name, projectId } },
+    data: { actorId: user.id, actorName: user.name, action: 'shop.updateCreds', targetType: 'Project', targetId: projectId, meta: { ozonClientId } },
   });
   revalidatePath('/projects');
 }
@@ -511,33 +595,6 @@ export async function updateProductCostAction(formData: FormData) {
   revalidatePath('/products');
 }
 
-async function deleteStoreAction(formData: FormData) {
-  'use server';
-  const user = await requireUser();
-  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
-  const storeId = String(formData.get('storeId') || '');
-  if (!storeId) return;
-  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
-  await assertProjectAccess(user, store.projectId);
-
-  // Магазин удаляется вместе со всеми данными, которые были привязаны именно к нему
-  // (импортированные из Ozon финансовые операции и карточки товаров этого магазина),
-  // чтобы после удаления в дашборде не осталось «осиротевших» цифр.
-  await prisma.$transaction([
-    prisma.financeTransaction.deleteMany({ where: { storeId } }),
-    prisma.product.deleteMany({ where: { storeId } }),
-    prisma.store.delete({ where: { id: storeId } }),
-  ]);
-
-  await prisma.activityLog.create({
-    data: { actorId: user.id, actorName: user.name, action: 'store.delete', targetType: 'Store', targetId: storeId, meta: { name: store.name, projectId: store.projectId } },
-  });
-  revalidatePath('/projects');
-  revalidatePath('/dashboard');
-  revalidatePath('/expenses');
-  revalidatePath('/products');
-}
-
 export default async function ProjectsPage() {
   const user = await requireUser();
   if (!isManagerOrAbove(user.role)) redirect('/dashboard');
@@ -559,8 +616,8 @@ export default async function ProjectsPage() {
   return (
     <div>
       <div className="panel">
-        <h2>Продавцы и проекты</h2>
-        {visibleClients.length === 0 && <div className="empty-state">Проектов пока нет.</div>}
+        <h2>Продавцы и магазины</h2>
+        {visibleClients.length === 0 && <div className="empty-state">Магазинов пока нет.</div>}
         {visibleClients.map((client) => (
           <div key={client.id} style={{ marginBottom: 20 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
@@ -571,10 +628,10 @@ export default async function ProjectsPage() {
                     type="text"
                     name="name"
                     defaultValue={client.name}
-                    style={{ fontSize: 15, fontWeight: 600, padding: '3px 6px', width: 200 }}
+                    style={{ fontSize: 15, fontWeight: 600, padding: '4px 8px', width: 260 }}
                   />
-                  <button className="btn" style={{ padding: '3px 8px', fontSize: 12 }} type="submit">
-                    ✓
+                  <button className="btn" style={{ padding: '4px 10px', fontSize: 12 }} type="submit">
+                    Сохранить
                   </button>
                 </form>
               ) : (
@@ -583,7 +640,7 @@ export default async function ProjectsPage() {
               {isAdmin && (
                 <form action={deleteClientAction}>
                   <input type="hidden" name="clientId" value={client.id} />
-                  <button className="btn btn-danger" style={{ padding: '3px 8px', fontSize: 12 }} type="submit">
+                  <button className="btn btn-danger" style={{ padding: '4px 10px', fontSize: 12 }} type="submit">
                     Удалить продавца
                   </button>
                 </form>
@@ -592,21 +649,54 @@ export default async function ProjectsPage() {
             <table className="data-table">
               <thead>
                 <tr>
-                  <th>Проект</th>
-                  <th>Магазины</th>
+                  <th>Магазин</th>
+                  <th>Площадка</th>
                   <th className="tooltip-hint" title="Ставка налога от выручки (например 6 для УСН «Доходы» 6%) — задаётся вручную, Ozon её не знает и не присылает">
                     Налог, %
                   </th>
                   <th>Команда</th>
                   {isAdmin && <th>Назначить</th>}
+                  {isAdmin && <th>Продавец</th>}
                   {isAdmin && <th>Действия</th>}
                 </tr>
               </thead>
               <tbody>
                 {client.projects.map((p) => (
                   <tr key={p.id}>
-                    <td>{p.name}</td>
-                    <td>{p.stores.map((s) => s.name).join(', ') || '—'}</td>
+                    <td style={{ minWidth: 160 }}>
+                      {isAdmin ? (
+                        <form action={renameShopAction} style={{ display: 'flex', gap: 4 }}>
+                          <input type="hidden" name="projectId" value={p.id} />
+                          <input
+                            type="text"
+                            name="name"
+                            defaultValue={p.name}
+                            style={{ width: 160, padding: '4px 6px', fontSize: 12.5 }}
+                          />
+                          <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            ✓
+                          </button>
+                        </form>
+                      ) : (
+                        p.name
+                      )}
+                    </td>
+                    <td>
+                      {isAdmin ? (
+                        <form action={changeShopMarketplaceAction} style={{ display: 'flex', gap: 4 }}>
+                          <input type="hidden" name="projectId" value={p.id} />
+                          <select name="marketplace" defaultValue={p.marketplace} style={{ fontSize: 12, padding: '4px 6px' }}>
+                            <option value="OZON">Ozon</option>
+                            <option value="WILDBERRIES">Wildberries</option>
+                          </select>
+                          <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            ✓
+                          </button>
+                        </form>
+                      ) : (
+                        <span className="pill">{MARKETPLACE_LABEL[p.marketplace] ?? p.marketplace}</span>
+                      )}
+                    </td>
                     <td>
                       <form action={updateProjectTaxRateAction} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
                         <input type="hidden" name="projectId" value={p.id} />
@@ -662,19 +752,24 @@ export default async function ProjectsPage() {
                     )}
                     {isAdmin && (
                       <td>
-                        <form action={renameProjectAction} style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
+                        <form action={changeShopOwnerAction} style={{ display: 'flex', gap: 4 }}>
                           <input type="hidden" name="projectId" value={p.id} />
-                          <input
-                            type="text"
-                            name="name"
-                            defaultValue={p.name}
-                            style={{ width: 110, padding: '4px 6px', fontSize: 12.5 }}
-                          />
+                          <select name="clientId" defaultValue={client.id} style={{ fontSize: 12, padding: '4px 6px' }}>
+                            {clients.map((c) => (
+                              <option key={c.id} value={c.id}>
+                                {c.name}
+                              </option>
+                            ))}
+                          </select>
                           <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
-                            ✓
+                            Заменить
                           </button>
                         </form>
-                        <form action={deleteProjectAction}>
+                      </td>
+                    )}
+                    {isAdmin && (
+                      <td>
+                        <form action={deleteShopAction}>
                           <input type="hidden" name="projectId" value={p.id} />
                           <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
                             Удалить
@@ -691,114 +786,90 @@ export default async function ProjectsPage() {
       </div>
 
       <div className="panel">
-        <h2>Магазины Ozon</h2>
+        <h2>Подключение к площадке</h2>
         <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
           Client-Id и Api-Key берутся в личном кабинете Ozon Seller: Настройки → Seller API. Ключ хранится на
           сервере в зашифрованном виде и повторно нигде не показывается — только последние 4 символа, чтобы
-          понять, какой ключ сохранён. Удаление магазина необратимо и удаляет вместе с ним все загруженные из
-          Ozon финансовые операции и товары этого магазина.
+          понять, какой ключ сохранён. Поле Api-Key можно оставить пустым, чтобы не менять уже сохранённый ключ —
+          заполняется только при первом подключении или замене ключа. Подключение для Wildberries появится
+          позже — площадку для магазина уже можно отметить заранее в таблице выше.
         </p>
 
-        {visibleClients.flatMap((c) => c.projects).every((p) => p.stores.length === 0) && (
-          <div className="empty-state">Магазинов пока нет — добавьте первый ниже.</div>
-        )}
+        {visibleClients.flatMap((c) => c.projects).length === 0 && <div className="empty-state">Магазинов пока нет — добавьте первый ниже.</div>}
 
         {visibleClients.map((client) =>
-          client.projects
-            .filter((p) => p.stores.length > 0)
-            .map((p) => (
+          client.projects.map((p) => {
+            const store = p.stores[0];
+            return (
               <div key={p.id} style={{ marginBottom: 18 }}>
                 <h3>
-                  {client.name} · {p.name}
+                  {client.name} · {p.name} · {MARKETPLACE_LABEL[p.marketplace] ?? p.marketplace}
                 </h3>
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>Магазин</th>
-                      <th>Client-Id</th>
-                      <th>Api-Key</th>
-                      <th>Проверка подключения</th>
-                      <th>Синхронизация за 30 дней</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {p.stores.map((s) => (
-                      <tr key={s.id}>
-                        <td>{s.name}</td>
-                        <td style={{ fontVariantNumeric: 'tabular-nums' }}>{s.ozonClientId || '—'}</td>
-                        <td>{s.ozonApiKeyLast4 ? `••••${s.ozonApiKeyLast4}` : '—'}</td>
-                        <td>
-                          <div style={{ marginBottom: 6 }}>
-                            {s.lastTestAt ? (
-                              <span className={`pill ${s.lastTestOk ? 'ok' : 'critical'}`}>{s.lastTestOk ? 'Подключено' : 'Ошибка'}</span>
-                            ) : (
-                              <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не проверялось</span>
-                            )}
-                            {s.lastTestMessage && (
-                              <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>{s.lastTestMessage}</div>
-                            )}
-                          </div>
-                          <form action={testStoreConnectionAction}>
-                            <input type="hidden" name="storeId" value={s.id} />
-                            <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
-                              Проверить
-                            </button>
-                          </form>
-                        </td>
-                        <td>
-                          <div style={{ marginBottom: 6 }}>
-                            {s.lastSyncAt ? (
-                              <span className={`pill ${s.lastSyncOk ? 'ok' : 'critical'}`}>{s.lastSyncOk ? 'Успешно' : 'Ошибка'}</span>
-                            ) : (
-                              <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не запускалась</span>
-                            )}
-                            {s.lastSyncMessage && (
-                              <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2 }}>{s.lastSyncMessage}</div>
-                            )}
-                          </div>
-                          <form action={syncStoreAction}>
-                            <input type="hidden" name="storeId" value={s.id} />
-                            <input type="hidden" name="days" value={30} />
-                            <button className="btn btn-primary" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
-                              Синхронизировать
-                            </button>
-                          </form>
-                        </td>
-                        <td>
-                          <form action={deleteStoreAction}>
-                            <input type="hidden" name="storeId" value={s.id} />
-                            <button className="btn btn-danger" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
-                              Удалить
-                            </button>
-                          </form>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )),
-        )}
+                <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                  <form action={updateShopCredsAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <input type="hidden" name="projectId" value={p.id} />
+                    <input
+                      type="text"
+                      name="ozonClientId"
+                      placeholder="Ozon Client-Id"
+                      defaultValue={store?.ozonClientId ?? ''}
+                      style={{ width: 130, padding: '4px 6px', fontSize: 12.5 }}
+                    />
+                    <input
+                      type="password"
+                      name="ozonApiKey"
+                      placeholder={store?.ozonApiKeyLast4 ? `оставить ••••${store.ozonApiKeyLast4}` : 'Ozon Api-Key'}
+                      autoComplete="off"
+                      style={{ width: 170, padding: '4px 6px', fontSize: 12.5 }}
+                    />
+                    <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                      Сохранить
+                    </button>
+                  </form>
 
-        <h3>Добавить магазин</h3>
-        <form action={addStoreAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
-          <select name="projectId">
-            {visibleClients.flatMap((c) =>
-              c.projects.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {c.name} · {p.name}
-                </option>
-              )),
-            )}
-          </select>
-          <input type="text" name="name" placeholder="Название магазина" required />
-          <input type="text" name="ozonClientId" placeholder="Ozon Client-Id" />
-          <input type="password" name="ozonApiKey" placeholder="Ozon Api-Key" autoComplete="off" />
-          <button className="btn btn-primary" type="submit">
-            Добавить
-          </button>
-        </form>
+                  {store && (
+                    <>
+                      <div style={{ fontSize: 12.5 }}>
+                        {store.lastTestAt ? (
+                          <span className={`pill ${store.lastTestOk ? 'ok' : 'critical'}`}>{store.lastTestOk ? 'Подключено' : 'Ошибка'}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не проверялось</span>
+                        )}
+                        {store.lastTestMessage && (
+                          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2, maxWidth: 220 }}>{store.lastTestMessage}</div>
+                        )}
+                        <form action={testStoreConnectionAction} style={{ marginTop: 4 }}>
+                          <input type="hidden" name="storeId" value={store.id} />
+                          <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            Проверить
+                          </button>
+                        </form>
+                      </div>
+
+                      <div style={{ fontSize: 12.5 }}>
+                        {store.lastSyncAt ? (
+                          <span className={`pill ${store.lastSyncOk ? 'ok' : 'critical'}`}>{store.lastSyncOk ? 'Успешно' : 'Ошибка'}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>синхронизация не запускалась</span>
+                        )}
+                        {store.lastSyncMessage && (
+                          <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2, maxWidth: 260 }}>{store.lastSyncMessage}</div>
+                        )}
+                        <form action={syncStoreAction} style={{ marginTop: 4 }}>
+                          <input type="hidden" name="storeId" value={store.id} />
+                          <input type="hidden" name="days" value={30} />
+                          <button className="btn btn-primary" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                            Синхронизировать
+                          </button>
+                        </form>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          }),
+        )}
       </div>
 
       {isAdmin && (
@@ -815,8 +886,8 @@ export default async function ProjectsPage() {
 
       {isAdmin && (
         <div className="panel">
-          <h2>Добавить проект</h2>
-          <form action={createProjectAction} style={{ display: 'flex', gap: 8 }}>
+          <h2>Добавить магазин</h2>
+          <form action={createShopAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
             <select name="clientId">
               {clients.map((c) => (
                 <option key={c.id} value={c.id}>
@@ -824,7 +895,13 @@ export default async function ProjectsPage() {
                 </option>
               ))}
             </select>
-            <input type="text" name="name" placeholder="Название проекта" required style={{ flex: 1 }} />
+            <input type="text" name="name" placeholder="Название магазина" required />
+            <select name="marketplace" defaultValue="OZON">
+              <option value="OZON">Ozon</option>
+              <option value="WILDBERRIES">Wildberries</option>
+            </select>
+            <input type="text" name="ozonClientId" placeholder="Ozon Client-Id (можно позже)" />
+            <input type="password" name="ozonApiKey" placeholder="Ozon Api-Key (можно позже)" autoComplete="off" />
             <button className="btn btn-primary" type="submit">
               Создать
             </button>

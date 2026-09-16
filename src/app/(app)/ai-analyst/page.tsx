@@ -143,7 +143,7 @@ export default async function AiAnalystPage({
   const projects = await listAccessibleProjects(user);
 
   if (projects.length === 0) {
-    return <div className="empty-state">У вас пока нет доступных проектов. Обратитесь к администратору.</div>;
+    return <div className="empty-state">У вас пока нет доступных магазинов. Обратитесь к администратору.</div>;
   }
 
   const projectId = searchParams.projectId && projects.some((p) => p.id === searchParams.projectId) ? searchParams.projectId : projects[0].id;
@@ -194,7 +194,7 @@ export default async function AiAnalystPage({
         </p>
 
         <div className="chat-thread">
-          {messages.length === 0 && <div className="empty-state">Пока нет вопросов по этому проекту — задайте первый ниже.</div>}
+          {messages.length === 0 && <div className="empty-state">Пока нет вопросов по этому магазину — задайте первый ниже.</div>}
           {messages.map((m) => (
             <div key={m.id} className={`chat-msg ${m.role === 'user' ? 'user' : 'assistant'}`}>
               <div className="chat-meta">

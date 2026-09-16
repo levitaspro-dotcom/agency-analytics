@@ -41,7 +41,7 @@ export default async function DashboardPage({
   const projects = await listAccessibleProjects(user);
 
   if (projects.length === 0) {
-    return <div className="empty-state">У вас пока нет доступных проектов. Обратитесь к администратору.</div>;
+    return <div className="empty-state">У вас пока нет доступных магазинов. Обратитесь к администратору.</div>;
   }
 
   const projectId = searchParams.projectId && projects.some((p) => p.id === searchParams.projectId) ? searchParams.projectId : projects[0].id;

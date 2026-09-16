@@ -19,7 +19,7 @@ export default async function ExpensesPage({
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
-  if (projects.length === 0) return <div className="empty-state">Нет доступных проектов.</div>;
+  if (projects.length === 0) return <div className="empty-state">Нет доступных магазинов.</div>;
 
   const projectId = searchParams.projectId && projects.some((p) => p.id === searchParams.projectId) ? searchParams.projectId : projects[0].id;
   await assertProjectAccess(user, projectId);

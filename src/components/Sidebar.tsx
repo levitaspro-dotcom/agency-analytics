@@ -34,14 +34,14 @@ export function Sidebar({ role, userName }: { role: string; userName: string }) 
           <>
             <div className="nav-section-title">Управление</div>
             <Link href="/projects" className={`nav-link ${pathname?.startsWith('/projects') ? 'active' : ''}`}>
-              Проекты и команда
+              Магазины и команда
             </Link>
           </>
         )}
         {role === 'SUPER_ADMIN' && (
           <>
             <Link href="/agency" className={`nav-link ${pathname?.startsWith('/agency') ? 'active' : ''}`}>
-              Агентство · все проекты
+              Агентство · все магазины
             </Link>
             <Link href="/settings" className={`nav-link ${pathname?.startsWith('/settings') ? 'active' : ''}`}>
               Настройки
