@@ -595,6 +595,7 @@ async function syncStoreAction(formData: FormData) {
   }
 
   let imported = 0;
+  let backfilledQty = 0;
   if (syncResult.ok) {
     const rows: {
       projectId: string;
@@ -680,15 +681,43 @@ async function syncStoreAction(formData: FormData) {
       }
     }
 
-    if (rows.length > 0) {
-      const created = await prisma.financeTransaction.createMany({ data: rows, skipDuplicates: true });
+    // Строки выручки, синхронизированные ещё до появления поля quantity, уже лежат в базе
+    // (createMany со skipDuplicates их не тронет — задваивать нечего, но и quantity само
+    // не появится). Раз уж период пересинхронизируется, заодно бесшумно дозаполняем quantity
+    // у уже сохранённых строк, чтобы «Кол-во, шт» на странице «Товары» не показывало пусто
+    // по старым продажам.
+    const revenueRowsWithQty = rows.filter((r) => r.type === 'REVENUE' && r.quantity !== undefined);
+    const otherRows = rows.filter((r) => !(r.type === 'REVENUE' && r.quantity !== undefined));
+    const newRevenueRows: typeof rows = [];
+    if (revenueRowsWithQty.length > 0) {
+      const existing = await prisma.financeTransaction.findMany({
+        where: { storeId: store.id, externalId: { in: revenueRowsWithQty.map((r) => r.externalId) } },
+        select: { id: true, externalId: true, quantity: true },
+      });
+      const existingByExternalId = new Map(existing.map((e) => [e.externalId as string, e]));
+      for (const r of revenueRowsWithQty) {
+        const match = existingByExternalId.get(r.externalId);
+        if (!match) {
+          newRevenueRows.push(r);
+        } else if (match.quantity == null && r.quantity != null) {
+          await prisma.financeTransaction.update({ where: { id: match.id }, data: { quantity: r.quantity } });
+          backfilledQty += 1;
+        }
+      }
+    }
+
+    const allNewRows = [...otherRows, ...newRevenueRows];
+    if (allNewRows.length > 0) {
+      const created = await prisma.financeTransaction.createMany({ data: allNewRows, skipDuplicates: true });
       imported = created.count;
     }
   }
 
   const parts = [
     productsResult.ok ? `товаров: ${productsResult.products.length} (новых: ${productsImported})` : `товары — ошибка: ${productsResult.message}`,
-    syncResult.ok ? `${syncResult.message} · новых операций сохранено: ${imported}` : `операции — ошибка: ${syncResult.message}`,
+    syncResult.ok
+      ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}`
+      : `операции — ошибка: ${syncResult.message}`,
   ];
   const overallOk = productsResult.ok && syncResult.ok;
 
