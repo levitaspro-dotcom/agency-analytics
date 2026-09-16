@@ -165,6 +165,40 @@ async function deleteUserAction(formData: FormData) {
   revalidatePath('/projects');
 }
 
+async function changeUserRoleAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const userId = String(formData.get('userId') || '');
+  const role = String(formData.get('role') || '');
+  if (!userId || !['SUPER_ADMIN', 'MANAGER', 'CLIENT'].includes(role)) return;
+
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  if (target.role === role) return;
+
+  // Нельзя понизить последнего главного администратора — иначе никто не сможет управлять
+  // пользователями и настройками.
+  if (target.role === 'SUPER_ADMIN' && role !== 'SUPER_ADMIN') {
+    const adminsLeft = await prisma.user.count({ where: { role: 'SUPER_ADMIN' } });
+    if (adminsLeft <= 1) {
+      throw new Error('Нельзя понизить последнего главного администратора.');
+    }
+  }
+
+  await prisma.user.update({ where: { id: userId }, data: { role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT' } });
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.changeRole',
+      targetType: 'User',
+      targetId: userId,
+      meta: { email: target.email, from: target.role, to: role },
+    },
+  });
+  revalidatePath('/settings');
+}
+
 async function saveAiProviderAction(formData: FormData) {
   'use server';
   const admin = await requireUser();
@@ -316,7 +350,19 @@ export default async function SettingsPage({
               <tr key={u.id}>
                 <td>{u.name}</td>
                 <td>{u.email}</td>
-                <td>{ROLE_LABEL[u.role] ?? u.role}</td>
+                <td>
+                  <form action={changeUserRoleAction} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    <input type="hidden" name="userId" value={u.id} />
+                    <select name="role" defaultValue={u.role} style={{ fontSize: 12, padding: '2px 4px' }}>
+                      <option value="SUPER_ADMIN">Главный администратор</option>
+                      <option value="MANAGER">Менеджер</option>
+                      <option value="CLIENT">Продавец</option>
+                    </select>
+                    <button className="btn" style={{ padding: '2px 8px', fontSize: 11 }} type="submit">
+                      Сохранить
+                    </button>
+                  </form>
+                </td>
                 <td>
                   {u.inviteAcceptedAt ? (
                     <span className="pill ok">Активен</span>
