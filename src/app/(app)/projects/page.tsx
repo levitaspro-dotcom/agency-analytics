@@ -6,7 +6,7 @@ import { requireUser, isManagerOrAbove, assertProjectAccess } from '@/lib/authz'
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
 import { issueInvite } from '@/lib/invite';
-import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, type OzonOperation } from '@/lib/integrations/ozon';
+import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, type OzonOperation, type OzonPostingProductLine } from '@/lib/integrations/ozon';
 
 export const dynamic = 'force-dynamic';
 
@@ -536,6 +536,9 @@ async function syncStoreAction(formData: FormData) {
       const canonicalId: string = canonical.id;
       for (const alias of p.skuAliases) productIdByAliasSku.set(alias, canonicalId);
       productIdByAliasSku.set(p.sku, canonicalId);
+      // Строки заказа (posting.products[]), которыми теперь считаем выручку, иногда несут
+      // только offer_id без числового sku — индексируем и по нему, чтобы не терять привязку к товару.
+      productIdByAliasSku.set(p.offerId, canonicalId);
 
       // 3) любые другие записи того же товара (дубликаты, накопившиеся в прошлых
       // синхронизациях под другим алиасом SKU до перехода на offer_id) — сливаем в
@@ -564,15 +567,15 @@ async function syncStoreAction(formData: FormData) {
     }
   }
 
-  let syncResult: { ok: boolean; message: string; operations: OzonOperation[] };
+  let syncResult: { ok: boolean; message: string; operations: OzonOperation[]; productLines: OzonPostingProductLine[] };
   try {
     syncResult = await fetchOzonFinanceTransactions(creds, from, to);
   } catch (e) {
-    syncResult = { ok: false, message: (e as Error).message, operations: [] };
+    syncResult = { ok: false, message: (e as Error).message, operations: [], productLines: [] };
   }
 
   // Себестоимость проданного Ozon не знает и не присылает — считаем сами:
-  // quantity (из строки начисления) × Product.costPrice (введена вручную).
+  // quantity (из строки заказа) × Product.costPrice (введена вручную).
   // Берём актуальные цены уже после слияния дубликатов выше.
   const productCostPriceById = new Map<string, number>();
   {
@@ -596,54 +599,53 @@ async function syncStoreAction(formData: FormData) {
       externalId: string;
     }[] = [];
 
+    // Выручка и себестоимость — из состава заказа (posting.products[]: артикул, количество,
+    // цена за единицу). Финансовый метод Ozon (/v1/finance/accrual/postings, ниже) надёжно
+    // отдаёт только удержания — суммы самой продажи в нём нет, поэтому раньше «Выручка»
+    // почти всегда оставалась нулевой при вполне реальных продажах и комиссиях.
+    for (const line of syncResult.productLines) {
+      const date = new Date(line.date);
+      const lineKey = line.sku ?? line.offerId;
+      const productId = lineKey ? productIdByAliasSku.get(lineKey) ?? null : null;
+      const revenue = line.price * line.quantity;
+      if (revenue <= 0) continue;
+
+      rows.push({
+        projectId: store.projectId,
+        storeId: store.id,
+        productId,
+        type: 'REVENUE',
+        category: 'Продажи Ozon',
+        amount: revenue,
+        date,
+        externalId: `${line.postingNumber}:${lineKey ?? 'x'}:revenue`,
+      });
+
+      const costPrice = productId ? productCostPriceById.get(productId) : undefined;
+      if (productId && costPrice && costPrice > 0) {
+        rows.push({
+          projectId: store.projectId,
+          storeId: store.id,
+          productId,
+          type: 'COGS',
+          category: 'Себестоимость проданных товаров',
+          amount: costPrice * line.quantity,
+          date,
+          externalId: `${line.postingNumber}:${lineKey ?? 'x'}:cogs`,
+        });
+      }
+    }
+
+    // Комиссии, логистика и прочие удержания Ozon — из финансового метода. Строки с
+    // положительной суммой там редки (не относятся к продаже товара — например, разовая
+    // компенсация) и учитываются отдельной, явно помеченной категорией, чтобы не задваивать
+    // выручку, которую мы уже посчитали выше по составу заказа.
     for (const op of syncResult.operations) {
       const date = new Date(op.operation_date);
-      const accrual = op.accruals_for_sale || 0;
       const net = op.amount || 0;
-      const fee = accrual - net;
       const productId = op.sku ? productIdByAliasSku.get(op.sku) ?? null : null;
 
-      if (accrual > 0) {
-        rows.push({
-          projectId: store.projectId,
-          storeId: store.id,
-          productId,
-          type: 'REVENUE',
-          category: 'Продажи Ozon',
-          amount: accrual,
-          date,
-          externalId: `${op.operation_id}:revenue`,
-        });
-
-        // Строка начисления с положительной суммой и известным количеством — это
-        // продажа единиц товара: если себестоимость для товара введена, сразу же
-        // признаём её расходом за тот же период, что и выручку по этой же продаже.
-        const costPrice = productId ? productCostPriceById.get(productId) : undefined;
-        if (productId && costPrice && costPrice > 0 && op.quantity && op.quantity > 0) {
-          rows.push({
-            projectId: store.projectId,
-            storeId: store.id,
-            productId,
-            type: 'COGS',
-            category: 'Себестоимость проданных товаров',
-            amount: costPrice * op.quantity,
-            date,
-            externalId: `${op.operation_id}:cogs`,
-          });
-        }
-      }
-      if (fee > 0) {
-        rows.push({
-          projectId: store.projectId,
-          storeId: store.id,
-          productId,
-          type: 'OZON_FEE',
-          category: op.operation_type_name || 'Комиссия Ozon',
-          amount: fee,
-          date,
-          externalId: `${op.operation_id}:fee`,
-        });
-      } else if (accrual === 0 && net < 0) {
+      if (net < 0) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
@@ -654,13 +656,13 @@ async function syncStoreAction(formData: FormData) {
           date,
           externalId: `${op.operation_id}:fee`,
         });
-      } else if (accrual === 0 && net > 0) {
+      } else if (net > 0) {
         rows.push({
           projectId: store.projectId,
           storeId: store.id,
           productId,
           type: 'REVENUE',
-          category: op.operation_type_name || 'Прочие начисления Ozon',
+          category: op.operation_type_name ? `Прочее начисление Ozon: ${op.operation_type_name}` : 'Прочие начисления Ozon',
           amount: net,
           date,
           externalId: `${op.operation_id}:revenue`,

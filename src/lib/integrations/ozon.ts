@@ -78,10 +78,28 @@ export interface OzonOperation {
   quantity?: number;
 }
 
+/**
+ * Одна строка проданного товара внутри отправления (из /v3/posting/fbs/list и
+ * /v2/posting/fbo/list — стабильных, давно не менявшихся методов списка заказов).
+ * Используется как основной источник выручки: финансовый метод /v1/finance/accrual/postings
+ * отдаёт только строки удержаний (комиссия, логистика и т.п.), а не сумму самой продажи —
+ * см. комментарий у fetchOzonFinanceTransactions ниже.
+ */
+export interface OzonPostingProductLine {
+  postingNumber: string;
+  date: string;
+  sku?: string;
+  offerId?: string;
+  name?: string;
+  price: number;
+  quantity: number;
+}
+
 export interface OzonSyncResult {
   ok: boolean;
   message: string;
   operations: OzonOperation[];
+  productLines: OzonPostingProductLine[];
 }
 
 /** Разбивает массив на батчи фиксированного размера (Ozon принимает не больше 200 posting_numbers за один запрос). */
@@ -92,12 +110,49 @@ function chunkArray<T>(arr: T[], size: number): T[][] {
 }
 
 /**
- * Собирает номера отправлений (posting_number) за период через два стабильных,
- * давно не менявшихся метода Ozon — отдельно FBS и FBO (у аккаунта может быть
- * задействована любая из схем или обе сразу).
+ * Достаёт строки проданных товаров прямо из отправления (posting.products[] — обычный,
+ * давно стабильный формат заказа Ozon: артикул/sku, количество, цена за единицу). Именно
+ * отсюда берём выручку, а не из финансового метода — см. комментарий у
+ * fetchOzonFinanceTransactions. Дата — по времени поступления заказа в обработку
+ * (in_process_at), с осторожным запасным вариантом на случай отсутствия поля.
  */
-async function fetchPostingNumbers(creds: OzonCredentials, dateFrom: Date, dateTo: Date): Promise<{ postingNumbers: string[]; errors: string[] }> {
+function extractProductLines(posting: any): OzonPostingProductLine[] {
+  const postingNumber = posting?.posting_number ? String(posting.posting_number) : '';
+  if (!postingNumber) return [];
+  const date = posting?.in_process_at ?? posting?.shipment_date ?? posting?.created_at ?? new Date().toISOString();
+  const items: any[] = Array.isArray(posting?.products) ? posting.products : [];
+  const lines: OzonPostingProductLine[] = [];
+  for (const it of items) {
+    const price = Number(it?.price) || 0;
+    const quantity = Number(it?.quantity) || 0;
+    if (price <= 0 || quantity <= 0) continue;
+    lines.push({
+      postingNumber,
+      date,
+      sku: it?.sku !== undefined && it?.sku !== null ? String(it.sku) : undefined,
+      offerId: it?.offer_id !== undefined && it?.offer_id !== null ? String(it.offer_id) : undefined,
+      name: it?.name ? String(it.name) : undefined,
+      price,
+      quantity,
+    });
+  }
+  return lines;
+}
+
+/**
+ * Собирает номера отправлений (posting_number) и строки проданных товаров за период
+ * через два стабильных, давно не менявшихся метода Ozon — отдельно FBS и FBO (у аккаунта
+ * может быть задействована любая из схем или обе сразу). Тем же вызовом, которым раньше
+ * доставали только номера отправлений для финансового API, теперь забираем и состав
+ * заказа (products[]) — он уже есть в ответе, просто раньше не использовался.
+ */
+async function fetchPostingNumbers(
+  creds: OzonCredentials,
+  dateFrom: Date,
+  dateTo: Date,
+): Promise<{ postingNumbers: string[]; productLines: OzonPostingProductLine[]; errors: string[] }> {
   const postingNumbers = new Set<string>();
+  const productLines: OzonPostingProductLine[] = [];
   const errors: string[] = [];
 
   // FBS: POST /v3/posting/fbs/list — пагинация limit/offset, лимит страницы до 50, признак конца — has_next.
@@ -116,7 +171,10 @@ async function fetchPostingNumbers(creds: OzonCredentials, dateFrom: Date, dateT
         break;
       }
       const postings: any[] = json?.result?.postings ?? [];
-      for (const p of postings) if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+      for (const p of postings) {
+        if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+        productLines.push(...extractProductLines(p));
+      }
       if (!json?.result?.has_next || postings.length === 0) break;
       offset += limit;
     }
@@ -138,13 +196,16 @@ async function fetchPostingNumbers(creds: OzonCredentials, dateFrom: Date, dateT
         break;
       }
       const postings: any[] = json?.result ?? [];
-      for (const p of postings) if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+      for (const p of postings) {
+        if (p?.posting_number) postingNumbers.add(String(p.posting_number));
+        productLines.push(...extractProductLines(p));
+      }
       if (postings.length < limit) break;
       offset += limit;
     }
   }
 
-  return { postingNumbers: [...postingNumbers], errors };
+  return { postingNumbers: [...postingNumbers], productLines, errors };
 }
 
 /**
@@ -282,6 +343,12 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
  * не притворится «успешной с нулём операций», а вернёт ok:false с диагностикой реальной
  * структуры ответа, чтобы это было видно в интерфейсе и можно было быстро донастроить
  * сопоставление полей.
+ *
+ * ВАЖНО про выручку: этот метод отдаёт только строки удержаний (комиссия, логистика,
+ * эквайринг и т.п. — все со знаком минус) и не содержит надёжной строки с суммой самой
+ * продажи. Поэтому сумму продаж (REVENUE) мы берём не отсюда, а из состава заказа
+ * (posting.products[] — см. fetchPostingNumbers/extractProductLines), а этот метод отвечает
+ * только за расходные категории (OZON_FEE).
  */
 export async function fetchOzonFinanceTransactions(
   creds: OzonCredentials,
@@ -290,12 +357,24 @@ export async function fetchOzonFinanceTransactions(
 ): Promise<OzonSyncResult> {
   const operations: OzonOperation[] = [];
 
-  const { postingNumbers, errors: postingErrors } = await fetchPostingNumbers(creds, dateFrom, dateTo);
+  const { postingNumbers, productLines, errors: postingErrors } = await fetchPostingNumbers(creds, dateFrom, dateTo);
   if (postingNumbers.length === 0) {
     if (postingErrors.length > 0) {
-      return { ok: false, message: `Не удалось получить список отправлений: ${postingErrors.join('; ')}`, operations };
+      return { ok: false, message: `Не удалось получить список отправлений: ${postingErrors.join('; ')}`, operations, productLines: [] };
     }
-    return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations };
+    return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations, productLines: [] };
+  }
+
+  if (productLines.length === 0) {
+    // Отправления есть, но ни в одном не нашлось состава заказа (products[]) — раньше
+    // это поле не использовалось и могло незаметно поменять формат. Не показываем тихий
+    // ноль по выручке — просим прислать пример для донастройки.
+    return {
+      ok: false,
+      message: `Отправлений за период: ${postingNumbers.length}, но ни в одном не нашлось состава заказа (products[]) — не могу посчитать выручку. Нужна проверка формата ответа /v3/posting/fbs/list · /v2/posting/fbo/list.`,
+      operations,
+      productLines: [],
+    };
   }
 
   const { map: typeNames, diagnostic: typeNamesDiagnostic } = await fetchAccrualTypeNames(creds);
@@ -307,7 +386,7 @@ export async function fetchOzonFinanceTransactions(
       posting_numbers: batch,
     });
     if (!ok) {
-      return { ok: false, message: ozonErrorMessage(status, json), operations };
+      return { ok: false, message: ozonErrorMessage(status, json), operations, productLines };
     }
     const postingAccruals = extractPostingAccruals(json);
     if (postingAccruals === null) {
@@ -326,6 +405,7 @@ export async function fetchOzonFinanceTransactions(
       ok: false,
       message: `Получено ${postingsWithAccrualsSeen} отправлений (из ${postingNumbers.length} за период), но ни одной строки начисления в них не найдено — возможно, формат вложенного accruals[] изменился. Нужна проверка.`,
       operations,
+      productLines,
     };
   }
 
@@ -334,6 +414,7 @@ export async function fetchOzonFinanceTransactions(
       ok: false,
       message: `Ozon вернул ответ в незнакомом формате — нужна донастройка интеграции. Отправлений найдено: ${postingNumbers.length}. Структура ответа: ${unrecognizedSample}`,
       operations,
+      productLines,
     };
   }
 
@@ -341,8 +422,9 @@ export async function fetchOzonFinanceTransactions(
   const noteTypeNames = typeNamesDiagnostic ? ` · названия категорий не распознаны (${typeNamesDiagnostic})` : '';
   return {
     ok: true,
-    message: `Отправлений за период: ${postingNumbers.length}. Загружено операций: ${operations.length}${notePosting}${noteTypeNames}`,
+    message: `Отправлений за период: ${postingNumbers.length}. Товарных строк (выручка): ${productLines.length}. Расходных операций: ${operations.length}${notePosting}${noteTypeNames}`,
     operations,
+    productLines,
   };
 }
 
