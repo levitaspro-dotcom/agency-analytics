@@ -809,10 +809,13 @@ export default async function ProjectsPage({
             </div>
 
             {isAdmin && (
-              <div style={{ marginBottom: 10, padding: '8px 10px', background: 'var(--bg-muted, #f4f4f5)', borderRadius: 6 }}>
-                <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 6 }}>
-                  Доступ продавца{client.users.length > 0 ? ` (${client.users.length})` : ''}:
-                </div>
+              <details style={{ marginBottom: 10, padding: '8px 10px', background: 'var(--bg-muted, #f4f4f5)', borderRadius: 6 }}>
+                <summary
+                  style={{ fontSize: 12.5, color: 'var(--text-muted)', cursor: 'pointer', userSelect: 'none' }}
+                >
+                  Доступ продавца{client.users.length > 0 ? ` (${client.users.length})` : ''}
+                </summary>
+                <div style={{ marginTop: 8 }}>
                 {client.users.length === 0 ? (
                   <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 8 }}>
                     Доступа пока нет — продавец не может войти в систему.
@@ -875,7 +878,8 @@ export default async function ProjectsPage({
                     </form>
                   );
                 })()}
-              </div>
+                </div>
+              </details>
             )}
 
             <table className="data-table">
