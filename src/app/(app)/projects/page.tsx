@@ -1,8 +1,11 @@
 import { redirect } from 'next/navigation';
 import { revalidatePath } from 'next/cache';
+import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import { requireUser, isManagerOrAbove, assertProjectAccess } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
+import { issueInvite } from '@/lib/invite';
 import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, type OzonOperation } from '@/lib/integrations/ozon';
 
 export const dynamic = 'force-dynamic';
@@ -23,6 +26,124 @@ async function createClientAction(formData: FormData) {
     data: { actorId: user.id, actorName: user.name, action: 'client.create', targetType: 'Client', targetId: client.id, meta: { name } },
   });
   revalidatePath('/projects');
+}
+
+// Даёт продавцу доступ (логин): создаёт пользователя с ролью «Продавец», привязанного к этому
+// продавцу, и отправляет ему письмо-приглашение — то же самое, что «Добавить пользователя» в
+// Настройках, но прямо в карточке продавца и сразу с привязкой, без похода в другой раздел.
+async function grantAccessAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const clientId = String(formData.get('clientId') || '');
+  const email = String(formData.get('email') || '').trim().toLowerCase();
+  const name = String(formData.get('name') || '').trim();
+  if (!clientId || !email || !name) return;
+
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) {
+    redirect(`/projects?accessError=${encodeURIComponent('Пользователь с таким email уже есть.')}`);
+  }
+
+  // Пароль никто не вводит и не видит — случайная строка только для того, чтобы поле было
+  // непустым. Войти можно только через ссылку из письма, где пользователь сам задаёт пароль.
+  const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
+  const newUser = await prisma.user.create({ data: { email, name, role: 'CLIENT', clientId, passwordHash } });
+  await prisma.activityLog.create({
+    data: { actorId: admin.id, actorName: admin.name, action: 'user.create', targetType: 'User', targetId: email, meta: { role: 'CLIENT', name, clientId } },
+  });
+
+  const { link, result } = await issueInvite(newUser.id, email, name);
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.invite',
+      targetType: 'User',
+      targetId: newUser.id,
+      meta: { email, emailSent: result.ok, emailMessage: result.message },
+    },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/settings');
+  if (!result.ok) {
+    redirect(`/projects?accessLink=${encodeURIComponent(link)}&accessEmail=${encodeURIComponent(email)}`);
+  }
+}
+
+async function resendAccessAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const userId = String(formData.get('userId') || '');
+  if (!userId) return;
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  if (target.inviteAcceptedAt) return;
+
+  const { link, result } = await issueInvite(target.id, target.email, target.name);
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.reinvite',
+      targetType: 'User',
+      targetId: userId,
+      meta: { email: target.email, emailSent: result.ok, emailMessage: result.message },
+    },
+  });
+  revalidatePath('/projects');
+  if (!result.ok) {
+    redirect(`/projects?accessLink=${encodeURIComponent(link)}&accessEmail=${encodeURIComponent(target.email)}`);
+  }
+}
+
+// Удаляет один логин продавца (не самого продавца). При удалении продавца целиком все его
+// логины удаляются автоматически вместе с ним — см. deleteClientAction.
+async function removeAccessAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const userId = String(formData.get('userId') || '');
+  if (!userId) return;
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+
+  await prisma.$transaction([
+    prisma.projectAssignment.deleteMany({ where: { userId } }),
+    prisma.user.delete({ where: { id: userId } }),
+  ]);
+  await prisma.activityLog.create({
+    data: {
+      actorId: admin.id,
+      actorName: admin.name,
+      action: 'user.delete',
+      targetType: 'User',
+      targetId: userId,
+      meta: { email: target.email, name: target.name, role: target.role, clientId: target.clientId },
+    },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/settings');
+}
+
+// Привязывает уже существующий логин с ролью «Продавец» (например заведённый раньше, до
+// появления этой связи, или созданный в Настройках без выбора продавца) к продавцу — без
+// создания нового логина и без повторной отправки приглашения.
+async function linkAccessAction(formData: FormData) {
+  'use server';
+  const admin = await requireUser();
+  if (admin.role !== 'SUPER_ADMIN') throw new Error('Недостаточно прав');
+  const clientId = String(formData.get('clientId') || '');
+  const userId = String(formData.get('userId') || '');
+  if (!clientId || !userId) return;
+  const target = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
+  if (target.role !== 'CLIENT') throw new Error('Привязать к продавцу можно только логин с ролью «Продавец».');
+
+  await prisma.user.update({ where: { id: userId }, data: { clientId } });
+  await prisma.activityLog.create({
+    data: { actorId: admin.id, actorName: admin.name, action: 'user.linkClient', targetType: 'User', targetId: userId, meta: { clientId } },
+  });
+  revalidatePath('/projects');
+  revalidatePath('/settings');
 }
 
 // Магазин — это продавец-проект (Project) вместе с его единственным подключением к площадке
@@ -101,14 +222,18 @@ async function deleteClientAction(formData: FormData) {
   const client = await prisma.client.findUniqueOrThrow({ where: { id: clientId } });
   const projects = await prisma.project.findMany({ where: { clientId }, select: { id: true } });
   const projectIds = projects.map((p) => p.id);
+  const usersOfClient = await prisma.user.findMany({ where: { clientId }, select: { id: true } });
 
   // Удаление продавца необратимо и удаляет вместе с ним все его магазины и всё, что было
-  // загружено по ним (подключения к площадкам, товары, финансовые операции) — как и при
-  // удалении отдельного магазина, чтобы не оставалось «осиротевших» данных.
+  // загружено по ним (подключения к площадкам, товары, финансовые операции), а также все
+  // логины (доступы), выданные этому продавцу — как вы и просили, доступ продавца не должен
+  // «зависать» в системе после удаления самого продавца.
   await prisma.$transaction([
     prisma.financeTransaction.deleteMany({ where: { projectId: { in: projectIds } } }),
     prisma.product.deleteMany({ where: { projectId: { in: projectIds } } }),
     prisma.store.deleteMany({ where: { projectId: { in: projectIds } } }),
+    prisma.projectAssignment.deleteMany({ where: { userId: { in: usersOfClient.map((u) => u.id) } } }),
+    prisma.user.deleteMany({ where: { clientId } }),
     prisma.project.deleteMany({ where: { clientId } }),
     prisma.client.delete({ where: { id: clientId } }),
   ]);
@@ -120,12 +245,13 @@ async function deleteClientAction(formData: FormData) {
       action: 'client.delete',
       targetType: 'Client',
       targetId: clientId,
-      meta: { name: client.name, shopsDeleted: projectIds.length },
+      meta: { name: client.name, shopsDeleted: projectIds.length, accessDeleted: usersOfClient.length },
     },
   });
   revalidatePath('/projects');
   revalidatePath('/agency');
   revalidatePath('/dashboard');
+  revalidatePath('/settings');
 }
 
 async function renameShopAction(formData: FormData) {
@@ -223,6 +349,17 @@ async function assignUserAction(formData: FormData) {
   const projectId = String(formData.get('projectId') || '');
   const userId = String(formData.get('userId') || '');
   if (!projectId || !userId) return;
+
+  // Логин продавца можно назначать только на магазины его же продавца — иначе легко случайно
+  // открыть чужому продавцу доступ к чужому магазину. Менеджеров это ограничение не касается.
+  const [project, target] = await Promise.all([
+    prisma.project.findUniqueOrThrow({ where: { id: projectId } }),
+    prisma.user.findUniqueOrThrow({ where: { id: userId } }),
+  ]);
+  if (target.role === 'CLIENT' && target.clientId !== project.clientId) {
+    throw new Error('Этот логин принадлежит другому продавцу — ему нельзя дать доступ к чужому магазину.');
+  }
+
   await prisma.projectAssignment.upsert({
     where: { projectId_userId: { projectId, userId } },
     update: {},
@@ -595,13 +732,20 @@ export async function updateProductCostAction(formData: FormData) {
   revalidatePath('/products');
 }
 
-export default async function ProjectsPage() {
+export default async function ProjectsPage({
+  searchParams,
+}: {
+  searchParams: { accessLink?: string; accessEmail?: string; accessError?: string };
+}) {
   const user = await requireUser();
   if (!isManagerOrAbove(user.role)) redirect('/dashboard');
   const isAdmin = user.role === 'SUPER_ADMIN';
 
   const clients = await prisma.client.findMany({
-    include: { projects: { include: { stores: true, assignments: { include: { user: true } } } } },
+    include: {
+      projects: { include: { stores: true, assignments: { include: { user: true } } } },
+      users: { orderBy: { createdAt: 'asc' } },
+    },
     orderBy: { createdAt: 'asc' },
   });
 
@@ -615,6 +759,23 @@ export default async function ProjectsPage() {
 
   return (
     <div>
+      {isAdmin && searchParams.accessError && (
+        <div className="panel" style={{ borderColor: 'var(--bad)' }}>
+          <div style={{ color: 'var(--bad)', fontWeight: 600 }}>{searchParams.accessError}</div>
+        </div>
+      )}
+      {isAdmin && searchParams.accessLink && (
+        <div className="panel">
+          <h2>Ссылка-приглашение для {searchParams.accessEmail}</h2>
+          <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 10 }}>
+            Письмо отправить не удалось (см. историю действий в Настройках — там причина) — передайте ссылку
+            вручную, она действует 7 дней:
+          </p>
+          <code style={{ display: 'block', padding: '8px 10px', background: 'var(--bg-muted, #f4f4f5)', borderRadius: 6, wordBreak: 'break-all', fontSize: 12.5 }}>
+            {searchParams.accessLink}
+          </code>
+        </div>
+      )}
       <div className="panel">
         <h2>Продавцы и магазины</h2>
         {visibleClients.length === 0 && <div className="empty-state">Магазинов пока нет.</div>}
@@ -646,6 +807,77 @@ export default async function ProjectsPage() {
                 </form>
               )}
             </div>
+
+            {isAdmin && (
+              <div style={{ marginBottom: 10, padding: '8px 10px', background: 'var(--bg-muted, #f4f4f5)', borderRadius: 6 }}>
+                <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 6 }}>
+                  Доступ продавца{client.users.length > 0 ? ` (${client.users.length})` : ''}:
+                </div>
+                {client.users.length === 0 ? (
+                  <div style={{ fontSize: 12.5, color: 'var(--text-muted)', marginBottom: 8 }}>
+                    Доступа пока нет — продавец не может войти в систему.
+                  </div>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
+                    {client.users.map((u) => (
+                      <div key={u.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', fontSize: 12.5 }}>
+                        <span>
+                          {u.name} ({u.email})
+                        </span>
+                        {u.inviteAcceptedAt ? (
+                          <span className="pill ok">Доступ активен</span>
+                        ) : (
+                          <>
+                            <span className="pill warning">Ждёт входа по ссылке</span>
+                            <form action={resendAccessAction}>
+                              <input type="hidden" name="userId" value={u.id} />
+                              <button className="btn" style={{ padding: '2px 8px', fontSize: 11 }} type="submit">
+                                Отправить ссылку ещё раз
+                              </button>
+                            </form>
+                          </>
+                        )}
+                        <form action={removeAccessAction}>
+                          <input type="hidden" name="userId" value={u.id} />
+                          <button className="btn btn-danger" style={{ padding: '2px 8px', fontSize: 11 }} type="submit">
+                            Удалить доступ
+                          </button>
+                        </form>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <form action={grantAccessAction} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center', marginBottom: 6 }}>
+                  <input type="hidden" name="clientId" value={client.id} />
+                  <input type="text" name="name" placeholder="Имя" required style={{ fontSize: 12, padding: '3px 6px', width: 140 }} />
+                  <input type="email" name="email" placeholder="Email" required style={{ fontSize: 12, padding: '3px 6px', width: 190 }} />
+                  <button className="btn" style={{ padding: '3px 8px', fontSize: 11 }} type="submit">
+                    Дать доступ
+                  </button>
+                </form>
+                {(() => {
+                  const unlinked = allUsers.filter((u) => u.role === 'CLIENT' && !u.clientId);
+                  if (unlinked.length === 0) return null;
+                  return (
+                    <form action={linkAccessAction} style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                      <input type="hidden" name="clientId" value={client.id} />
+                      <span style={{ fontSize: 11.5, color: 'var(--text-muted)' }}>или привязать уже существующий логин:</span>
+                      <select name="userId" style={{ fontSize: 12, padding: '3px 6px' }}>
+                        {unlinked.map((u) => (
+                          <option key={u.id} value={u.id}>
+                            {u.name} ({u.email})
+                          </option>
+                        ))}
+                      </select>
+                      <button className="btn" style={{ padding: '3px 8px', fontSize: 11 }} type="submit">
+                        Привязать
+                      </button>
+                    </form>
+                  );
+                })()}
+              </div>
+            )}
+
             <table className="data-table">
               <thead>
                 <tr>
@@ -731,25 +963,35 @@ export default async function ProjectsPage() {
                             </div>
                           ))}
                     </td>
-                    {isAdmin && (
-                      <td>
-                        <form action={assignUserAction} style={{ display: 'flex', gap: 6 }}>
-                          <input type="hidden" name="projectId" value={p.id} />
-                          <select name="userId" style={{ fontSize: 12, padding: '4px 6px' }}>
-                            {allUsers
-                              .filter((u) => u.role !== 'SUPER_ADMIN')
-                              .map((u) => (
-                                <option key={u.id} value={u.id}>
-                                  {u.name}
-                                </option>
-                              ))}
-                          </select>
-                          <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }}>
-                            Назначить
-                          </button>
-                        </form>
-                      </td>
-                    )}
+                    {isAdmin &&
+                      (() => {
+                        // Менеджеров можно назначать на любой магазин; логин продавца — только
+                        // на магазины его же продавца (доступ выдаётся точечно, по магазинам).
+                        const assignable = allUsers.filter((u) => u.role === 'MANAGER' || (u.role === 'CLIENT' && u.clientId === client.id));
+                        return (
+                          <td>
+                            {assignable.length === 0 ? (
+                              <span style={{ color: 'var(--text-muted)', fontSize: 11.5 }}>
+                                Нет доступных логинов — выдайте доступ продавцу выше.
+                              </span>
+                            ) : (
+                              <form action={assignUserAction} style={{ display: 'flex', gap: 6 }}>
+                                <input type="hidden" name="projectId" value={p.id} />
+                                <select name="userId" style={{ fontSize: 12, padding: '4px 6px' }}>
+                                  {assignable.map((u) => (
+                                    <option key={u.id} value={u.id}>
+                                      {u.name}
+                                    </option>
+                                  ))}
+                                </select>
+                                <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }}>
+                                  Назначить
+                                </button>
+                              </form>
+                            )}
+                          </td>
+                        );
+                      })()}
                     {isAdmin && (
                       <td>
                         <form action={changeShopOwnerAction} style={{ display: 'flex', gap: 4 }}>

@@ -40,6 +40,11 @@ model User {
   passwordHash      String
   name              String
   role              UserRole
+  /// Продавец (Client), к которому привязан этот логин — заполняется для роли CLIENT: это его
+  /// доступ, выданный конкретному продавцу. У менеджеров и главных администраторов не задаётся.
+  /// Удаление продавца удаляет вместе с ним и все привязанные к нему логины (доступы).
+  clientId          String?
+  client            Client?             @relation(fields: [clientId], references: [id], onDelete: Cascade)
   /// Когда пользователь сам задал пароль по ссылке из письма-приглашения. Пусто — приглашение
   /// отправлено, но ещё не принято (пароль случайный, никому не известен и вход невозможен).
   inviteAcceptedAt  DateTime?
@@ -49,6 +54,8 @@ model User {
   aiMessages        AiMessage[]
   aiRecommendations AiRecommendation[]
   inviteTokens      InviteToken[]
+
+  @@index([clientId])
 }
 
 /// Одноразовая ссылка-приглашение для первого входа: пользователь создаётся с заведомо
@@ -70,6 +77,7 @@ model Client {
   name      String
   createdAt DateTime  @default(now())
   projects  Project[]
+  users     User[]
 }
 
 model Project {

@@ -6,45 +6,7 @@ import { requireUser } from '@/lib/authz';
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
 import { createAdapter } from '@/lib/ai';
-import { sendEmail, inviteEmailHtml } from '@/lib/email';
-
-function baseUrl() {
-  return (process.env.NEXTAUTH_URL || 'http://localhost:3000').replace(/\/$/, '');
-}
-
-// Защита от случайной отправки нескольких писем подряд (двойной клик, повторная отправка
-// формы, повтор запроса браузером и т.п.): если для этого пользователя уже выпускалась
-// непринятая ссылка за последние 30 секунд, повторно не создаём токен и не шлём письмо —
-// отдаём ту же самую ссылку, которую уже отправили.
-const REISSUE_COOLDOWN_MS = 30_000;
-
-type RecentInviteRow = { token: string };
-
-/**
- * Создаёт одноразовую ссылку-приглашение (живёт 7 дней) и пытается отправить её на почту
- * через Resend. Если email-сервис не настроен или письмо не ушло — не делаем вид, что всё
- * получилось: возвращаем саму ссылку, чтобы админ мог передать её вручную.
- */
-async function issueInvite(userId: string, email: string, name: string) {
-  const recent = (await prisma.inviteToken.findFirst({
-    where: { userId, usedAt: null, createdAt: { gt: new Date(Date.now() - REISSUE_COOLDOWN_MS) } },
-    orderBy: { createdAt: 'desc' },
-    select: { token: true },
-  })) as RecentInviteRow | null;
-  if (recent) {
-    return {
-      link: `${baseUrl()}/invite/${recent.token}`,
-      result: { ok: true, message: 'Ссылка уже была отправлена несколько секунд назад — повторное письмо не отправлено.' },
-    };
-  }
-
-  const token = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-  await prisma.inviteToken.create({ data: { userId, token, expiresAt } });
-  const link = `${baseUrl()}/invite/${token}`;
-  const result = await sendEmail({ to: email, subject: 'Доступ к панели аналитики', html: inviteEmailHtml({ name, link }) });
-  return { link, result };
-}
+import { issueInvite } from '@/lib/invite';
 
 export const dynamic = 'force-dynamic';
 
@@ -66,6 +28,8 @@ async function createUserAction(formData: FormData) {
   const email = String(formData.get('email') || '').trim().toLowerCase();
   const name = String(formData.get('name') || '').trim();
   const role = String(formData.get('role') || 'CLIENT');
+  // Продавец, за которым закреплён логин — имеет смысл только для роли «Продавец» (CLIENT).
+  const clientId = role === 'CLIENT' ? String(formData.get('clientId') || '').trim() || null : null;
   if (!email || !name) return;
 
   const existing = await prisma.user.findUnique({ where: { email } });
@@ -76,9 +40,11 @@ async function createUserAction(formData: FormData) {
   // Пароль никто не вводит и не видит — случайная строка только для того, чтобы поле было
   // непустым. Войти можно только через ссылку из письма, где пользователь сам задаёт пароль.
   const passwordHash = await bcrypt.hash(crypto.randomBytes(24).toString('hex'), 10);
-  const user = await prisma.user.create({ data: { email, name, role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT', passwordHash } });
+  const user = await prisma.user.create({
+    data: { email, name, role: role as 'SUPER_ADMIN' | 'MANAGER' | 'CLIENT', clientId, passwordHash },
+  });
   await prisma.activityLog.create({
-    data: { actorId: admin.id, actorName: admin.name, action: 'user.create', targetType: 'User', targetId: email, meta: { role, name } },
+    data: { actorId: admin.id, actorName: admin.name, action: 'user.create', targetType: 'User', targetId: email, meta: { role, name, clientId } },
   });
 
   const { link, result } = await issueInvite(user.id, email, name);
@@ -252,7 +218,8 @@ export default async function SettingsPage({
   const user = await requireUser();
   if (user.role !== 'SUPER_ADMIN') redirect('/dashboard');
 
-  const users = await prisma.user.findMany({ orderBy: { createdAt: 'asc' } });
+  const users = await prisma.user.findMany({ orderBy: { createdAt: 'asc' }, include: { client: true } });
+  const clients = await prisma.client.findMany({ orderBy: { name: 'asc' } });
   const activity = await prisma.activityLog.findMany({ orderBy: { createdAt: 'desc' }, take: 30, include: { actor: true } });
   const aiConfig = await prisma.aiProviderConfig.findFirst({ where: { active: true }, orderBy: { updatedAt: 'desc' } });
 
@@ -340,6 +307,7 @@ export default async function SettingsPage({
               <th>Имя</th>
               <th>Email</th>
               <th>Роль</th>
+              <th>Продавец</th>
               <th>Статус</th>
               <th>Создан</th>
               <th></th>
@@ -363,6 +331,7 @@ export default async function SettingsPage({
                     </button>
                   </form>
                 </td>
+                <td>{u.client?.name ?? '—'}</td>
                 <td>
                   {u.inviteAcceptedAt ? (
                     <span className="pill ok">Активен</span>
@@ -412,10 +381,23 @@ export default async function SettingsPage({
             <option value="CLIENT">Продавец</option>
             <option value="SUPER_ADMIN">Главный администратор</option>
           </select>
+          <select name="clientId" defaultValue="" title="Только для роли «Продавец» — за каким продавцом закрепить логин">
+            <option value="">— не привязан к продавцу —</option>
+            {clients.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </select>
           <button className="btn btn-primary" type="submit">
             Создать и отправить приглашение
           </button>
         </form>
+        <p style={{ color: 'var(--text-muted)', fontSize: 12, marginTop: 6 }}>
+          Продавца из списка выше указывайте только для роли «Продавец» — для менеджеров и администраторов он
+          игнорируется. Для продавца доступ удобнее выдавать прямо в его карточке в разделе «Магазины и команда» —
+          там же видно, дан ли ему уже доступ.
+        </p>
       </div>
 
       <div className="panel">
