@@ -647,37 +647,127 @@ async function syncStoreAction(formData: FormData) {
       }
     }
 
+    // Ozon отдаёт sku далеко не в каждой строке начисления — часть сборов (особенно по
+    // отправлениям с несколькими товарами) приходит вообще без привязки к конкретному
+    // товару, и раньше такие сборы просто нигде не учитывались в разбивке по товару на
+    // странице «Товары» (хотя в общих «Расходах» и в «Обзоре» они по-прежнему были — там
+    // считаем по всем операциям без разбора). posting_number в начислении есть всегда, а
+    // состав отправления (кто именно в нём был и на какую сумму) мы уже знаем из
+    // productLines — по нему довосстанавливаем привязку: если в отправлении был один
+    // товар, сбор целиком его; если несколько — делим сбор между ними пропорционально
+    // выручке по каждому в этом отправлении.
+    const postingProductRevenue = new Map<string, Map<string, number>>();
+    for (const line of syncResult.productLines) {
+      const lineKey = line.sku ?? line.offerId;
+      const productId = lineKey ? productIdByAliasSku.get(lineKey) : undefined;
+      const revenue = line.price * line.quantity;
+      if (!productId || revenue <= 0) continue;
+      const byProduct = postingProductRevenue.get(line.postingNumber) ?? new Map<string, number>();
+      byProduct.set(productId, (byProduct.get(productId) ?? 0) + revenue);
+      postingProductRevenue.set(line.postingNumber, byProduct);
+    }
+
     // Комиссии, логистика и прочие удержания Ozon — из финансового метода. Строки с
     // положительной суммой там редки (не относятся к продаже товара — например, разовая
     // компенсация) и учитываются отдельной, явно помеченной категорией, чтобы не задваивать
     // выручку, которую мы уже посчитали выше по составу заказа.
+    //
+    // Каждую операцию сначала раскладываем в 1 (привязана к товару или не привязана вовсе)
+    // или несколько (разбита между товарами одного отправления) «кандидатных» строк, но не
+    // сразу в общий rows — сверяем с уже сохранённой версией той же операции (по «базовому»
+    // externalId без суффикса товара). Иначе при повторной синхронизации, когда привязка
+    // задним числом восстановилась (см. postingProductRevenue выше), старая безтоварная
+    // строка осталась бы в базе, а новая (или разбитая) добавилась бы поверх — сумма
+    // задвоилась бы.
+    const opRowsByBase = new Map<string, { productId: string | null; type: 'OZON_FEE' | 'REVENUE'; category: string; amount: number; date: Date; externalId: string }[]>();
     for (const op of syncResult.operations) {
       const date = new Date(op.operation_date);
       const net = op.amount || 0;
-      const productId = op.sku ? productIdByAliasSku.get(op.sku) ?? null : null;
+      if (net === 0) continue;
+      const type: 'OZON_FEE' | 'REVENUE' = net < 0 ? 'OZON_FEE' : 'REVENUE';
+      const amountAbs = Math.abs(net);
+      const category =
+        net < 0
+          ? op.operation_type_name || 'Комиссия Ozon'
+          : op.operation_type_name
+            ? `Прочее начисление Ozon: ${op.operation_type_name}`
+            : 'Прочие начисления Ozon';
+      const externalIdBase = net < 0 ? `${op.operation_id}:fee` : `${op.operation_id}:revenue`;
 
-      if (net < 0) {
-        rows.push({
-          projectId: store.projectId,
-          storeId: store.id,
-          productId,
-          type: 'OZON_FEE',
-          category: op.operation_type_name || 'Комиссия Ozon',
-          amount: Math.abs(net),
-          date,
-          externalId: `${op.operation_id}:fee`,
-        });
-      } else if (net > 0) {
-        rows.push({
-          projectId: store.projectId,
-          storeId: store.id,
-          productId,
-          type: 'REVENUE',
-          category: op.operation_type_name ? `Прочее начисление Ozon: ${op.operation_type_name}` : 'Прочие начисления Ozon',
-          amount: net,
-          date,
-          externalId: `${op.operation_id}:revenue`,
-        });
+      let directProductId = op.sku ? productIdByAliasSku.get(op.sku) ?? null : null;
+      if (!directProductId && op.postingNumber) {
+        const byProduct = postingProductRevenue.get(op.postingNumber);
+        if (byProduct && byProduct.size === 1) {
+          directProductId = Array.from(byProduct.keys())[0];
+        }
+      }
+
+      if (directProductId) {
+        opRowsByBase.set(externalIdBase, [{ productId: directProductId, type, category, amount: amountAbs, date, externalId: externalIdBase }]);
+        continue;
+      }
+
+      // Ни sku, ни однозначного единственного товара в отправлении — если отправление
+      // известно и в нём было несколько товаров, делим сбор между ними пропорционально
+      // их выручке в этом отправлении, а не теряем сбор целиком.
+      const byProduct = op.postingNumber ? postingProductRevenue.get(op.postingNumber) : undefined;
+      const totalRevenue = byProduct ? Array.from(byProduct.values()).reduce((s, v) => s + v, 0) : 0;
+      if (byProduct && byProduct.size > 1 && totalRevenue > 0) {
+        opRowsByBase.set(
+          externalIdBase,
+          Array.from(byProduct.entries()).map(([productId, revenue]) => ({
+            productId,
+            type,
+            category,
+            amount: amountAbs * (revenue / totalRevenue),
+            date,
+            externalId: `${externalIdBase}:${productId}`,
+          })),
+        );
+        continue;
+      }
+
+      // Совсем не удалось привязать (отправление не найдено среди productLines за этот
+      // период, например возврат по заказу из более раннего периода) — сохраняем без
+      // товара, как раньше, чтобы сумма не терялась хотя бы в общих расходах.
+      opRowsByBase.set(externalIdBase, [{ productId: null, type, category, amount: amountAbs, date, externalId: externalIdBase }]);
+    }
+
+    // Сверяем с уже сохранёнными строками этих же операций (по базовому externalId).
+    const opBaseIds = Array.from(opRowsByBase.keys());
+    const existingOpRows = opBaseIds.length
+      ? await prisma.financeTransaction.findMany({
+          where: { storeId: store.id, externalId: { in: opBaseIds } },
+          select: { id: true, externalId: true, productId: true },
+        })
+      : [];
+    const existingOpByBase = new Map(existingOpRows.map((e) => [e.externalId as string, e]));
+
+    for (const [baseId, candidateRows] of opRowsByBase) {
+      const existing = existingOpByBase.get(baseId);
+      const isSplit = candidateRows.length > 1;
+      if (!isSplit) {
+        const candidate = candidateRows[0];
+        if (existing) {
+          // Строка с таким externalId уже есть (была сохранена раньше, возможно ещё без
+          // привязки к товару). Новую не добавляем — только дозаполняем привязку, если
+          // раньше её не было, а теперь появилась.
+          if (existing.productId == null && candidate.productId != null) {
+            await prisma.financeTransaction.update({ where: { id: existing.id }, data: { productId: candidate.productId } });
+          }
+        } else {
+          rows.push({ projectId: store.projectId, storeId: store.id, ...candidate });
+        }
+      } else {
+        // Разбито на несколько товаров. Если раньше эта операция была сохранена одной
+        // безтоварной строкой (старый формат externalId, без суффикса товара) — удаляем
+        // её, иначе сумма задвоится с новыми, per-товарными строками.
+        if (existing) {
+          await prisma.financeTransaction.delete({ where: { id: existing.id } });
+        }
+        for (const candidate of candidateRows) {
+          rows.push({ projectId: store.projectId, storeId: store.id, ...candidate });
+        }
       }
     }
 

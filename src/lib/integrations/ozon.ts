@@ -76,6 +76,14 @@ export interface OzonOperation {
   sku?: string;
   /** Количество единиц товара в этой строке начисления — нужно, чтобы посчитать себестоимость проданного (quantity × Product.costPrice), которую сам Ozon не знает. */
   quantity?: number;
+  /**
+   * Номер отправления, к которому относится начисление. Ozon отдаёт sku далеко не в
+   * каждой строке начисления (у части сборов — например, части SaleCommission/Logistic
+   * по некоторым отправлениям — sku в ответе просто нет), но posting_number есть всегда.
+   * По нему можно найти состав этого отправления (posting.products[]) и привязать сбор
+   * к товару даже без прямого sku — см. использование в syncStoreAction.
+   */
+  postingNumber?: string;
 }
 
 /**
@@ -322,6 +330,7 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
         amount,
         sku: a.sku !== undefined && a.sku !== null ? String(a.sku) : undefined,
         quantity: Number.isFinite(Number(a.quantity)) && Number(a.quantity) > 0 ? Number(a.quantity) : undefined,
+        postingNumber: postingNumber || undefined,
       });
     }
   }
