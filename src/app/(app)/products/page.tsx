@@ -24,7 +24,7 @@ export default async function ProductsPage({
 
   const products = await computeProductInsights({ projectId, storeId, from, to });
   const productRows = await prisma.product.findMany({
-    where: { projectId, ...(storeId ? { storeId } : {}) },
+    where: { projectId, active: true, ...(storeId ? { storeId } : {}) },
     select: { id: true, sellPrice: true, costPrice: true },
   });
   const sellPriceById = new Map<string, { sellPrice: number; costPrice: number }>();

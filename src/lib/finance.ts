@@ -103,7 +103,9 @@ export async function computeProductInsights(params: {
   to: Date;
 }): Promise<ProductInsight[]> {
   const { projectId, storeId, from, to } = params;
-  const products = await prisma.product.findMany({ where: { projectId, ...(storeId ? { storeId } : {}) } });
+  // active:true — не показываем товары, которых больше нет в текущем каталоге Ozon этого
+  // магазина (сняты с продажи или остались от ранее подключённого другого Ozon-аккаунта).
+  const products = await prisma.product.findMany({ where: { projectId, active: true, ...(storeId ? { storeId } : {}) } });
   const productIds = products.map((p) => p.id);
 
   const txs = productIds.length

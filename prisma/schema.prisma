@@ -144,8 +144,16 @@ model Product {
   offerId      String?
   sellPrice    Float
   costPrice    Float
+  /// Товар есть в каталоге Ozon этого магазина по последней успешной синхронизации. При смене
+  /// Client-Id/Api-Key на другой Ozon-аккаунт (или если товар просто сняли с продажи) старые
+  /// записи не удаляются — на них могут ссылаться уже посчитанные финансовые операции — а
+  /// перестают быть активными и скрываются из списка «Товары», чтобы в нём не накапливались
+  /// позиции, которых в этом магазине на самом деле больше нет.
+  active       Boolean               @default(true)
   createdAt    DateTime              @default(now())
   transactions FinanceTransaction[]
+
+  @@index([projectId, storeId, active])
 }
 
 model FinanceTransaction {

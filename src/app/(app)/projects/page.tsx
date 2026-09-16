@@ -500,6 +500,14 @@ async function syncStoreAction(formData: FormData) {
   const productIdByAliasSku = new Map<string, string>();
   let productsImported = 0;
   if (productsResult.ok) {
+    // Сначала помечаем весь текущий каталог магазина неактивным — актуальные товары
+    // включатся обратно ниже, по мере обработки. То, что не встретилось в этом ответе
+    // Ozon (товар сняли с продажи, а на аккаунтах, где раньше стояли другие Client-Id/Api-Key,
+    // особенно — совсем другой каталог), останется неактивным и не будет попадать в список
+    // «Товары» этого магазина. Сами записи не удаляем — на них могут ссылаться уже
+    // посчитанные финансовые операции.
+    await prisma.product.updateMany({ where: { projectId: store.projectId, storeId: store.id }, data: { active: false } });
+
     const existingByOfferId = (await prisma.product.findMany({
       where: { projectId: store.projectId, storeId: store.id, offerId: { not: null } },
     })) as PRow[];
@@ -524,11 +532,11 @@ async function syncStoreAction(formData: FormData) {
         // её никогда не трогает и не перезаписывает.
         canonical = (await prisma.product.update({
           where: { id: canonical.id },
-          data: { name: p.name, sellPrice: p.sellPrice, sku: p.sku, offerId: p.offerId },
+          data: { name: p.name, sellPrice: p.sellPrice, sku: p.sku, offerId: p.offerId, active: true },
         })) as PRow;
       } else {
         canonical = (await prisma.product.create({
-          data: { projectId: store.projectId, storeId: store.id, sku: p.sku, offerId: p.offerId, name: p.name, sellPrice: p.sellPrice, costPrice: 0 },
+          data: { projectId: store.projectId, storeId: store.id, sku: p.sku, offerId: p.offerId, name: p.name, sellPrice: p.sellPrice, costPrice: 0, active: true },
         })) as PRow;
         productsImported += 1;
       }
