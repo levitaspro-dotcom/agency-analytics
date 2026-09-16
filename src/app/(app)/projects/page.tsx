@@ -663,7 +663,7 @@ export default async function ProjectsPage() {
               <tbody>
                 {client.projects.map((p) => (
                   <tr key={p.id}>
-                    <td style={{ minWidth: 160 }}>
+                    <td style={{ minWidth: 240 }}>
                       {isAdmin ? (
                         <form action={renameShopAction} style={{ display: 'flex', gap: 4 }}>
                           <input type="hidden" name="projectId" value={p.id} />
@@ -671,7 +671,7 @@ export default async function ProjectsPage() {
                             type="text"
                             name="name"
                             defaultValue={p.name}
-                            style={{ width: 160, padding: '4px 6px', fontSize: 12.5 }}
+                            style={{ width: 220, padding: '4px 6px', fontSize: 12.5 }}
                           />
                           <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
                             ✓
