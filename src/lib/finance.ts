@@ -129,8 +129,14 @@ export interface ProductInsight {
   otherFee: number;
   /** Сумма всех расходов по товару за период: себестоимость + все сборы Ozon. */
   totalExpenses: number;
-  /** null, если себестоимость ещё не введена — тогда маржу с единицы посчитать честно нельзя (не показываем в этом случае мнимые 100%). */
+  /** null, если себестоимость ещё не введена — тогда маржу с единицы посчитать честно нельзя (не показываем в этом случае мнимые 100%).
+   *  Считается по ТЕКУЩЕЙ цене товара в Ozon (Product.sellPrice, обновляется при каждой синхронизации), а не по цене,
+   *  по которой товар реально продавался в выбранном периоде — Ozon часто меняет цену/скидки, поэтому эта маржа может
+   *  заметно отличаться от unitMarginPeriod ниже. Показывает «маржу, если продать по сегодняшней цене». */
   unitMargin: number | null;
+  /** Маржа по фактической средней цене продажи за период (выручка / кол-во шт), а не по текущей цене Ozon.
+   *  null, если себестоимость не введена, либо за период не было продаж (не из чего считать среднюю цену). */
+  unitMarginPeriod: number | null;
   periodProfit: number;
   flag: 'critical' | 'warning' | null;
   reason?: string;
@@ -190,6 +196,8 @@ export async function computeProductInsights(params: {
       const totalExpenses = cogsFromTx + totalFees;
       const costKnown = p.costPrice > 0;
       const unitMargin = costKnown && p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : null;
+      const avgSalePrice = quantitySold > 0 ? revenue / quantitySold : null;
+      const unitMarginPeriod = costKnown && avgSalePrice && avgSalePrice > 0 ? (avgSalePrice - p.costPrice) / avgSalePrice : null;
       const periodProfit = revenue - totalExpenses;
       let flag: 'critical' | 'warning' | null = null;
       let reason: string | undefined;
@@ -203,7 +211,7 @@ export async function computeProductInsights(params: {
         reason = 'Убыток за период: расходы на товар (себестоимость + сборы Ozon) превышают выручку по нему';
       } else if (unitMargin !== null && unitMargin < 0.1) {
         flag = 'warning';
-        reason = `Маржа с единицы всего ${(unitMargin * 100).toFixed(1)}%`;
+        reason = `Маржа с единицы (по цене Ozon) всего ${(unitMargin * 100).toFixed(1)}%`;
       } else if (revenue === 0 && totalExpenses > 0) {
         flag = 'warning';
         reason = 'Есть расходы по товару без выручки за период';
@@ -222,6 +230,7 @@ export async function computeProductInsights(params: {
         otherFee: fees.other,
         totalExpenses,
         unitMargin,
+        unitMarginPeriod,
         periodProfit,
         flag,
         reason,

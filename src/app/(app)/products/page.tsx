@@ -30,9 +30,10 @@ export default async function ProductsPage({
   const { from, to } = resolvePeriod(searchParams);
   const canEdit = isManagerOrAbove(user.role);
 
+  const SORT_VALUES = ['margin_asc', 'margin_desc', 'margin_period_asc', 'margin_period_desc'] as const;
   const q = (searchParams.q || '').trim();
   const status = searchParams.status === 'selling' || searchParams.status === 'not_selling' ? searchParams.status : '';
-  const sort = searchParams.sort === 'margin_asc' || searchParams.sort === 'margin_desc' ? searchParams.sort : '';
+  const sort = (SORT_VALUES as readonly string[]).includes(searchParams.sort || '') ? (searchParams.sort as (typeof SORT_VALUES)[number]) : '';
 
   const allProducts = await computeProductInsights({ projectId, storeId, from, to });
   const productRows = await prisma.product.findMany({
@@ -58,6 +59,14 @@ export default async function ProductsPage({
       if (a.unitMargin === null) return 1;
       if (b.unitMargin === null) return -1;
       return (a.unitMargin - b.unitMargin) * dir;
+    });
+  } else if (sort === 'margin_period_asc' || sort === 'margin_period_desc') {
+    const dir = sort === 'margin_period_asc' ? 1 : -1;
+    products = [...products].sort((a, b) => {
+      if (a.unitMarginPeriod === null && b.unitMarginPeriod === null) return 0;
+      if (a.unitMarginPeriod === null) return 1;
+      if (b.unitMarginPeriod === null) return -1;
+      return (a.unitMarginPeriod - b.unitMarginPeriod) * dir;
     });
   }
   const filtersActive = q !== '' || status !== '' || sort !== '';
@@ -86,6 +95,12 @@ export default async function ProductsPage({
               товару. Рекламу и хранение Ozon отдаёт через другие отчёты — это отдельная задача, пока их здесь
               нет. Строки с убытком за период подсвечены.
             </p>
+            <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
+              Маржи теперь две: «по цене Ozon» считается от текущей цены товара в Ozon (какая маржа была бы,
+              продай его сегодня), «по факту периода» — от реальной средней цены продажи в периоде (выручка ÷
+              кол-во шт). Ozon часто меняет цену/скидки, поэтому они могут заметно расходиться — «по факту»
+              точнее отражает, сколько реально заработано на выбранный период.
+            </p>
             <form method="get" action="/products" className="topbar" style={{ marginBottom: 16, paddingBottom: 16 }}>
               <input type="hidden" name="projectId" value={projectId} />
               {storeId && <input type="hidden" name="storeId" value={storeId} />}
@@ -107,8 +122,10 @@ export default async function ProductsPage({
                 <label>Сортировка по марже</label>
                 <select name="sort" defaultValue={sort}>
                   <option value="">По умолчанию</option>
-                  <option value="margin_desc">Сначала высокая</option>
-                  <option value="margin_asc">Сначала низкая</option>
+                  <option value="margin_desc">По цене Ozon: сначала высокая</option>
+                  <option value="margin_asc">По цене Ozon: сначала низкая</option>
+                  <option value="margin_period_desc">По факту периода: сначала высокая</option>
+                  <option value="margin_period_asc">По факту периода: сначала низкая</option>
                 </select>
               </div>
               <button className="btn btn-primary" type="submit">
@@ -148,8 +165,14 @@ export default async function ProductsPage({
                     <th>Прочие сборы Ozon</th>
                     <th>Итого расходов</th>
                     <th>Прибыль за период</th>
-                    <th className="tooltip-hint" title="(цена продажи − себестоимость) / цена продажи">
-                      Маржа с единицы
+                    <th className="tooltip-hint" title="(текущая цена Ozon − себестоимость) / текущая цена Ozon — маржа, если продать по сегодняшней цене">
+                      Маржа (цена Ozon)
+                    </th>
+                    <th
+                      className="tooltip-hint"
+                      title="(выручка / кол-во шт − себестоимость) / (выручка / кол-во шт) — маржа по фактической средней цене продажи в этом периоде. «—», если за период не было продаж"
+                    >
+                      Маржа (по факту)
                     </th>
                     <th>Статус</th>
                   </tr>
@@ -206,6 +229,7 @@ export default async function ProductsPage({
                           {Math.round(p.periodProfit).toLocaleString('ru-RU')} ₽
                         </td>
                         <td>{p.unitMargin === null ? '—' : (p.unitMargin * 100).toFixed(1) + '%'}</td>
+                        <td>{p.unitMarginPeriod === null ? '—' : (p.unitMarginPeriod * 100).toFixed(1) + '%'}</td>
                         <td>
                           {p.flag ? (
                             <span className={`pill ${p.flag}`} title={p.reason}>
