@@ -118,6 +118,8 @@ export interface ProductInsight {
   /** Продано штук за период — из состава заказа (posting.products[]), 0 — значит заказов не было. */
   quantitySold: number;
   revenue: number;
+  /** Себестоимость проданного за период = quantitySold × текущая Product.costPrice (считается
+   *  здесь же, а не берётся из сохранённых COGS-строк — см. комментарий в computeProductInsights). */
   cogsFromTx: number;
   /** Комиссия Ozon за продажу и за бренд. */
   commissionFee: number;
@@ -162,7 +164,6 @@ export async function computeProductInsights(params: {
     : [];
 
   const revByProduct = new Map<string, number>();
-  const cogsByProduct = new Map<string, number>();
   const qtyByProduct = new Map<string, number>();
   const feeByProduct = new Map<string, { commission: number; logistics: number; handling: number; other: number }>();
   const feeRow = (id: string) => {
@@ -179,7 +180,6 @@ export async function computeProductInsights(params: {
       revByProduct.set(t.productId, (revByProduct.get(t.productId) ?? 0) + t.amount);
       if (t.quantity) qtyByProduct.set(t.productId, (qtyByProduct.get(t.productId) ?? 0) + t.quantity);
     }
-    if (t.type === 'COGS') cogsByProduct.set(t.productId, (cogsByProduct.get(t.productId) ?? 0) + t.amount);
     if (t.type === 'OZON_FEE') {
       const row = feeRow(t.productId);
       row[bucketFeeCategory(t.category)] += t.amount;
@@ -189,12 +189,19 @@ export async function computeProductInsights(params: {
   return products
     .map((p) => {
       const revenue = revByProduct.get(p.id) ?? 0;
-      const cogsFromTx = cogsByProduct.get(p.id) ?? 0;
       const quantitySold = qtyByProduct.get(p.id) ?? 0;
+      // Себестоимость проданного считаем здесь же, напрямую — кол-во шт (уже точное, см.
+      // qtyByProduct выше) × ТЕКУЩАЯ Product.costPrice, а не берём сумму сохранённых COGS-строк
+      // из FinanceTransaction. Те COGS-строки досоздаются только на очередной синхронизации, и
+      // если Ольга вводит/меняет себестоимость между синхронизациями, часть уже проданных штук
+      // так и остаётся без COGS-строки до следующего «Синхронизировать» — «Итого расходов» тогда
+      // тихо занижен, будто посчитан только по части проданного. Живой расчёт от кол-ва исключает
+      // этот разрыв: себестоимость учитывается сразу для всех проданных в периоде штук.
+      const costKnown = p.costPrice > 0;
+      const cogsFromTx = costKnown ? quantitySold * p.costPrice : 0;
       const fees = feeByProduct.get(p.id) ?? { commission: 0, logistics: 0, handling: 0, other: 0 };
       const totalFees = fees.commission + fees.logistics + fees.handling + fees.other;
       const totalExpenses = cogsFromTx + totalFees;
-      const costKnown = p.costPrice > 0;
       const unitMargin = costKnown && p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : null;
       const avgSalePrice = quantitySold > 0 ? revenue / quantitySold : null;
       const unitMarginPeriod = costKnown && avgSalePrice && avgSalePrice > 0 ? (avgSalePrice - p.costPrice) / avgSalePrice : null;
