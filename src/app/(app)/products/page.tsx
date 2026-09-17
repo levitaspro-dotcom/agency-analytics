@@ -54,7 +54,7 @@ export default async function ProductsPage({
               товару. Рекламу и хранение Ozon отдаёт через другие отчёты — это отдельная задача, пока их здесь
               нет. Строки с убытком за период подсвечены.
             </p>
-            <div style={{ overflowX: 'auto' }}>
+            <div className="table-scroll sticky-head" style={{ overflowX: 'auto' }}>
               <table className="data-table">
                 <thead>
                   <tr>
