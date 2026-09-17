@@ -10,7 +10,15 @@ export const dynamic = 'force-dynamic';
 export default async function ProductsPage({
   searchParams,
 }: {
-  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string };
+  searchParams: {
+    projectId?: string;
+    storeId?: string;
+    from?: string;
+    to?: string;
+    q?: string;
+    status?: string;
+    sort?: string;
+  };
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
@@ -22,7 +30,11 @@ export default async function ProductsPage({
   const { from, to } = resolvePeriod(searchParams);
   const canEdit = isManagerOrAbove(user.role);
 
-  const products = await computeProductInsights({ projectId, storeId, from, to });
+  const q = (searchParams.q || '').trim();
+  const status = searchParams.status === 'selling' || searchParams.status === 'not_selling' ? searchParams.status : '';
+  const sort = searchParams.sort === 'margin_asc' || searchParams.sort === 'margin_desc' ? searchParams.sort : '';
+
+  const allProducts = await computeProductInsights({ projectId, storeId, from, to });
   const productRows = await prisma.product.findMany({
     where: { projectId, active: true, ...(storeId ? { storeId } : {}) },
     select: { id: true, sellPrice: true, costPrice: true },
@@ -30,12 +42,32 @@ export default async function ProductsPage({
   const sellPriceById = new Map<string, { sellPrice: number; costPrice: number }>();
   for (const row of productRows) sellPriceById.set(row.id, { sellPrice: row.sellPrice, costPrice: row.costPrice });
 
+  // Поиск по названию/SKU, фильтр по статусу продаж и сортировка по марже — применяются к уже
+  // посчитанным показателям, категории товара Ozon не отдаёт (это отдельная задача на будущее).
+  let products = allProducts;
+  if (q) {
+    const needle = q.toLowerCase();
+    products = products.filter((p) => p.name.toLowerCase().includes(needle) || p.sku.toLowerCase().includes(needle));
+  }
+  if (status === 'selling') products = products.filter((p) => p.quantitySold > 0);
+  if (status === 'not_selling') products = products.filter((p) => p.quantitySold === 0);
+  if (sort === 'margin_asc' || sort === 'margin_desc') {
+    const dir = sort === 'margin_asc' ? 1 : -1;
+    products = [...products].sort((a, b) => {
+      if (a.unitMargin === null && b.unitMargin === null) return 0;
+      if (a.unitMargin === null) return 1;
+      if (b.unitMargin === null) return -1;
+      return (a.unitMargin - b.unitMargin) * dir;
+    });
+  }
+  const filtersActive = q !== '' || status !== '' || sort !== '';
+
   return (
     <div>
       <FilterBar basePath="/products" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
       <div className="panel">
         <h2>Товары за период</h2>
-        {products.length === 0 ? (
+        {allProducts.length === 0 ? (
           <div className="empty-state">
             В этом магазине пока нет товаров. Они появятся здесь автоматически после синхронизации
             (раздел «Магазины» → «Синхронизировать»).
@@ -54,6 +86,51 @@ export default async function ProductsPage({
               товару. Рекламу и хранение Ozon отдаёт через другие отчёты — это отдельная задача, пока их здесь
               нет. Строки с убытком за период подсвечены.
             </p>
+            <form method="get" action="/products" className="topbar" style={{ marginBottom: 16, paddingBottom: 16 }}>
+              <input type="hidden" name="projectId" value={projectId} />
+              {storeId && <input type="hidden" name="storeId" value={storeId} />}
+              <input type="hidden" name="from" value={searchParams.from ?? ''} />
+              <input type="hidden" name="to" value={searchParams.to ?? ''} />
+              <div className="field">
+                <label>Название или SKU</label>
+                <input type="text" name="q" defaultValue={q} placeholder="например, Кисель или 5342414889" style={{ minWidth: 220 }} />
+              </div>
+              <div className="field">
+                <label>Продажи</label>
+                <select name="status" defaultValue={status}>
+                  <option value="">Все</option>
+                  <option value="selling">Продаётся</option>
+                  <option value="not_selling">Нет продаж за период</option>
+                </select>
+              </div>
+              <div className="field">
+                <label>Сортировка по марже</label>
+                <select name="sort" defaultValue={sort}>
+                  <option value="">По умолчанию</option>
+                  <option value="margin_desc">Сначала высокая</option>
+                  <option value="margin_asc">Сначала низкая</option>
+                </select>
+              </div>
+              <button className="btn btn-primary" type="submit">
+                Применить
+              </button>
+              {filtersActive && (
+                <a
+                  className="btn"
+                  href={`/products?projectId=${projectId}${storeId ? `&storeId=${storeId}` : ''}&from=${searchParams.from ?? ''}&to=${searchParams.to ?? ''}`}
+                >
+                  Сбросить
+                </a>
+              )}
+            </form>
+            {filtersActive && (
+              <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
+                Найдено {products.length} из {allProducts.length}.
+              </p>
+            )}
+            {products.length === 0 ? (
+              <div className="empty-state">Ничего не найдено по этому фильтру.</div>
+            ) : (
             <div className="table-scroll sticky-head" style={{ overflowX: 'auto' }}>
               <table className="data-table">
                 <thead>
@@ -144,6 +221,7 @@ export default async function ProductsPage({
                 </tbody>
               </table>
             </div>
+            )}
           </>
         )}
       </div>
