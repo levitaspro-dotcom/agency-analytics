@@ -158,7 +158,12 @@ export interface ProductInsight {
   handlingFee: number;
   /** Прочие сборы Ozon, не попавшие в три группы выше (например, рассрочка). */
   otherFee: number;
-  /** Сумма всех расходов по товару за период: себестоимость + все сборы Ozon. */
+  /** Налог по этому товару за период = выручка товара × ставка налога проекта (см. комментарий в
+   *  computeProductInsights). 0, если ставка налога не задана в настройках проекта. */
+  taxAmount: number;
+  /** Ставка налога проекта (%) — для подписи рядом с суммой налога. */
+  taxRatePercent: number;
+  /** Сумма всех расходов по товару за период: себестоимость + все сборы Ozon + налог по товару. */
   totalExpenses: number;
   /** ТОВАРНАЯ НАЦЕНКА (не маржинальность — см. periodMargin ниже, это разные показатели по ТЗ,
    *  раздел 4): (цена − себестоимость) / цена, БЕЗ вычета комиссии, логистики и прочих сборов
@@ -175,11 +180,8 @@ export interface ProductInsight {
   unitMarginPeriod: number | null;
   periodProfit: number;
   /** НАСТОЯЩАЯ МАРЖИНАЛЬНОСТЬ по ТЗ (раздел 4): прибыль / выручка за период, ПОСЛЕ вычета
-   *  себестоимости и всех сборов Ozon (periodProfit / revenue) — не путать с unitMargin/
-   *  unitMarginPeriod выше (товарная наценка, без вычета расходов Ozon). Эти два показателя
-   *  могут отличаться в разы: наценка 76% при этом реальная маржинальность может быть
-   *  отрицательной, если расходы Ozon съели всю разницу. null, если за период не было выручки
-   *  (нечего делить). */
+   *  себестоимости, всех сборов Ozon И налога по товару (periodProfit / revenue). null, если за
+   *  период не было выручки (нечего делить). */
   periodMargin: number | null;
   flag: 'critical' | 'warning' | null;
   reason?: string;
@@ -195,7 +197,11 @@ export async function computeProductInsights(params: {
   const { projectId, storeId, from, to, dateBasis = 'order' } = params;
   // active:true — не показываем товары, которых больше нет в текущем каталоге Ozon этого
   // магазина (сняты с продажи или остались от ранее подключённого другого Ozon-аккаунта).
-  const products = await prisma.product.findMany({ where: { projectId, active: true, ...(storeId ? { storeId } : {}) } });
+  const [products, project] = await Promise.all([
+    prisma.product.findMany({ where: { projectId, active: true, ...(storeId ? { storeId } : {}) } }),
+    prisma.project.findUnique({ where: { id: projectId }, select: { taxRatePercent: true } }),
+  ]);
+  const taxRatePercent = project?.taxRatePercent ?? 0;
   const productIds = products.map((p) => p.id);
 
   const txs = productIds.length
@@ -243,7 +249,14 @@ export async function computeProductInsights(params: {
       const cogsFromTx = costKnown ? quantitySold * p.costPrice : 0;
       const fees = feeByProduct.get(p.id) ?? { commission: 0, logistics: 0, handling: 0, other: 0 };
       const totalFees = fees.commission + fees.logistics + fees.handling + fees.other;
-      const totalExpenses = cogsFromTx + totalFees;
+      // Налог по товару — по ставке проекта от выручки ИМЕННО этого товара за период (та же формула,
+      // что и computedTax в computeFinanceSummary выше, только не от выручки всего магазина, а от
+      // выручки конкретного товара). Ручные TAX-операции (если есть) сюда не входят — они не
+      // привязаны к товару. Сумма налога по товарам может быть чуть меньше налога в «Все расходы» на
+      // «Обзоре», если часть выручки не удалось привязать ни к одному товару (см. «Без привязки к
+      // товару» на странице «Товары») — сама сумма при этом нигде не теряется.
+      const taxAmount = taxRatePercent > 0 && revenue > 0 ? revenue * (taxRatePercent / 100) : 0;
+      const totalExpenses = cogsFromTx + totalFees + taxAmount;
       const unitMargin = costKnown && p.sellPrice > 0 ? (p.sellPrice - p.costPrice) / p.sellPrice : null;
       const avgSalePrice = quantitySold > 0 ? revenue / quantitySold : null;
       const unitMarginPeriod = costKnown && avgSalePrice && avgSalePrice > 0 ? (avgSalePrice - p.costPrice) / avgSalePrice : null;
@@ -258,7 +271,7 @@ export async function computeProductInsights(params: {
         reason = 'Себестоимость не указана — маржа с единицы не может быть посчитана';
       } else if (revenue > 0 && periodProfit < 0) {
         flag = 'critical';
-        reason = 'Убыток за период: расходы на товар (себестоимость + сборы Ozon) превышают выручку по нему';
+        reason = 'Убыток за период: расходы на товар (себестоимость + сборы Ozon + налог) превышают выручку по нему';
       } else if (unitMargin !== null && unitMargin < 0.1) {
         flag = 'warning';
         reason = `Наценка с единицы (по цене Ozon) всего ${(unitMargin * 100).toFixed(1)}% — это не маржинальность, расходы Ozon сюда ещё не вычтены`;
@@ -279,6 +292,8 @@ export async function computeProductInsights(params: {
         logisticsFee: fees.logistics,
         handlingFee: fees.handling,
         otherFee: fees.other,
+        taxAmount,
+        taxRatePercent,
         totalExpenses,
         unitMargin,
         unitMarginPeriod,

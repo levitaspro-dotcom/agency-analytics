@@ -32,14 +32,7 @@ export default async function ProductsPage({
   const canEdit = isManagerOrAbove(user.role);
   const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
 
-  const SORT_VALUES = [
-    'margin_asc',
-    'margin_desc',
-    'margin_period_asc',
-    'margin_period_desc',
-    'true_margin_asc',
-    'true_margin_desc',
-  ] as const;
+  const SORT_VALUES = ['true_margin_asc', 'true_margin_desc'] as const;
   const q = (searchParams.q || '').trim();
   const status = searchParams.status === 'selling' || searchParams.status === 'not_selling' ? searchParams.status : '';
   const sort = (SORT_VALUES as readonly string[]).includes(searchParams.sort || '') ? (searchParams.sort as (typeof SORT_VALUES)[number]) : '';
@@ -81,23 +74,7 @@ export default async function ProductsPage({
   }
   if (status === 'selling') products = products.filter((p) => p.quantitySold > 0);
   if (status === 'not_selling') products = products.filter((p) => p.quantitySold === 0);
-  if (sort === 'margin_asc' || sort === 'margin_desc') {
-    const dir = sort === 'margin_asc' ? 1 : -1;
-    products = [...products].sort((a, b) => {
-      if (a.unitMargin === null && b.unitMargin === null) return 0;
-      if (a.unitMargin === null) return 1;
-      if (b.unitMargin === null) return -1;
-      return (a.unitMargin - b.unitMargin) * dir;
-    });
-  } else if (sort === 'margin_period_asc' || sort === 'margin_period_desc') {
-    const dir = sort === 'margin_period_asc' ? 1 : -1;
-    products = [...products].sort((a, b) => {
-      if (a.unitMarginPeriod === null && b.unitMarginPeriod === null) return 0;
-      if (a.unitMarginPeriod === null) return 1;
-      if (b.unitMarginPeriod === null) return -1;
-      return (a.unitMarginPeriod - b.unitMarginPeriod) * dir;
-    });
-  } else if (sort === 'true_margin_asc' || sort === 'true_margin_desc') {
+  if (sort === 'true_margin_asc' || sort === 'true_margin_desc') {
     const dir = sort === 'true_margin_asc' ? 1 : -1;
     products = [...products].sort((a, b) => {
       if (a.periodMargin === null && b.periodMargin === null) return 0;
@@ -121,6 +98,7 @@ export default async function ProductsPage({
       acc.logisticsFee += p.logisticsFee;
       acc.handlingFee += p.handlingFee;
       acc.otherFee += p.otherFee;
+      acc.taxAmount += p.taxAmount;
       acc.totalExpenses += p.totalExpenses;
       acc.periodProfit += p.periodProfit;
       return acc;
@@ -133,6 +111,7 @@ export default async function ProductsPage({
       logisticsFee: 0,
       handlingFee: 0,
       otherFee: 0,
+      taxAmount: 0,
       totalExpenses: 0,
       periodProfit: 0,
     },
@@ -162,20 +141,15 @@ export default async function ProductsPage({
               Комиссия, логистика и обработка отправления — по данным Ozon за период, отдельно по каждому
               товару. Реклама (оплата за клик), эквайринг, доставка до места выдачи и подобные сборы теперь
               тоже подтягиваются при синхронизации, но Ozon в принципе не привязывает их к конкретному товару
-              (это не позаказные, а периодические расходы) — их сумма учтена в «Итого расходов» на уровне всего
+              (это не позаказные, а периодические расходы) — их сумма учтена в «Все расходы» на уровне всего
               магазина, в «Расходах» и «Обзоре», но не в разбивке по товарам ниже (см. «Без привязки к товару»
               под таблицей). Хранение Ozon пока отдаёт только через отдельный отчёт — эта категория ещё не
               подключена. Строки с убытком за период подсвечены.
             </p>
             <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
-              «Наценка» и «Маржинальность» — разные показатели, их легко перепутать. <b>Наценка</b> (два
-              столбца — «по цене Ozon» от текущей цены товара, «по факту периода» от реальной средней цены
-              продажи в периоде) — это просто (цена − себестоимость) / цена, БЕЗ вычета комиссии, логистики и
-              прочих сборов Ozon: показывает наценку «на бумаге», а не прибыльность. <b>Маржинальность</b> —
-              это прибыль / выручка за период, ПОСЛЕ вычета всех расходов (как определено в ТЗ, раздел 4) —
-              именно она показывает, сколько реально заработано. Наценка в 76% при этом легко уживается с
-              отрицательной маржинальностью, если сборы Ozon съели всю разницу — ориентируйтесь на
-              «Маржинальность», не на «Наценку».
+              <b>Маржинальность</b> — это прибыль / выручка по товару за период, ПОСЛЕ вычета себестоимости,
+              всех сборов Ozon И налога по этому товару (наведите на заголовки столбцов «Итого расходов»,
+              «Прибыль за период» и «Маржинальность» — там расписано, что именно входит в каждый).
             </p>
             {dateBasis === 'accrual' && (
               <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
@@ -211,10 +185,6 @@ export default async function ProductsPage({
                   <option value="">По умолчанию</option>
                   <option value="true_margin_desc">Маржинальность: сначала высокая</option>
                   <option value="true_margin_asc">Маржинальность: сначала низкая</option>
-                  <option value="margin_desc">Наценка по цене Ozon: сначала высокая</option>
-                  <option value="margin_asc">Наценка по цене Ozon: сначала низкая</option>
-                  <option value="margin_period_desc">Наценка по факту периода: сначала высокая</option>
-                  <option value="margin_period_asc">Наценка по факту периода: сначала низкая</option>
                 </select>
               </div>
               <button className="btn btn-primary" type="submit">
@@ -260,30 +230,27 @@ export default async function ProductsPage({
                     <th>Прочие сборы Ozon</th>
                     <th
                       className="tooltip-hint"
-                      title="Себестоимость проданного (кол-во шт × себестоимость) + сборы Ozon по этому товару за период (Комиссия + Логистика + Обработка отправления + Прочие сборы). Это только ОЗОН-расходы и себестоимость — налог и внешние расходы сюда не входят, они не привязаны к конкретному товару, их итог смотрите в «Все расходы» на «Обзоре»/«Отчётах»."
+                      title="Ставка налога задаётся в настройках проекта. Налог по товару = выручка по этому товару за период × ставка налога. 0 ₽, если ставка не задана."
+                    >
+                      Налог
+                    </th>
+                    <th
+                      className="tooltip-hint"
+                      title="Себестоимость проданного (кол-во шт × себестоимость) + сборы Ozon по этому товару за период (Комиссия + Логистика + Обработка отправления + Прочие сборы) + налог по товару. Внешние расходы сюда не входят — они не привязаны к конкретному товару, их итог смотрите в «Все расходы» на «Обзоре»/«Отчётах»."
                     >
                       Итого расходов
                     </th>
                     <th
                       className="tooltip-hint"
-                      title="Выручка по товару за период минус «Итого расходов» по нему (себестоимость проданного + все сборы Ozon). Налог здесь НЕ вычитается — он считается по всему магазину, не по отдельному товару, см. «Прибыль после налога» на «Обзоре»."
+                      title="Выручка по товару за период минус «Итого расходов» по нему (себестоимость проданного + все сборы Ozon + налог по товару)."
                     >
                       Прибыль за период
                     </th>
                     <th
                       className="tooltip-hint"
-                      title="Прибыль / выручка за период, ПОСЛЕ вычета себестоимости и всех сборов Ozon (ТЗ, раздел 4) — настоящая маржинальность, не путать с наценкой в двух столбцах справа. Налог сюда не входит (см. «Итого расходов» выше). «—», если за период не было выручки"
+                      title="Прибыль / выручка за период, ПОСЛЕ вычета себестоимости, всех сборов Ozon И налога по товару — настоящая маржинальность. «—», если за период не было выручки"
                     >
                       Маржинальность
-                    </th>
-                    <th className="tooltip-hint" title="Наценка «на бумаге», БЕЗ вычета комиссии/логистики/сборов Ozon: (текущая цена Ozon − себестоимость) / текущая цена Ozon — какая была бы наценка, продай товар сегодня. Не показатель прибыльности — см. «Маржинальность»">
-                      Наценка (цена Ozon)
-                    </th>
-                    <th
-                      className="tooltip-hint"
-                      title="Наценка «на бумаге», БЕЗ вычета комиссии/логистики/сборов Ozon: (выручка / кол-во шт − себестоимость) / (выручка / кол-во шт) — по фактической средней цене продажи в этом периоде. Не показатель прибыльности — см. «Маржинальность». «—», если за период не было продаж"
-                    >
-                      Наценка (по факту)
                     </th>
                     <th>Статус</th>
                   </tr>
@@ -340,6 +307,13 @@ export default async function ProductsPage({
                         <td>{Math.round(p.logisticsFee).toLocaleString('ru-RU')} ₽</td>
                         <td>{Math.round(p.handlingFee).toLocaleString('ru-RU')} ₽</td>
                         <td>{Math.round(p.otherFee).toLocaleString('ru-RU')} ₽</td>
+                        <td style={{ fontVariantNumeric: 'tabular-nums' }}>
+                          {p.taxAmount > 0
+                            ? `${Math.round(p.taxAmount).toLocaleString('ru-RU')} ₽ (${p.taxRatePercent}%)`
+                            : p.taxRatePercent > 0
+                              ? '0 ₽'
+                              : '—'}
+                        </td>
                         <td>{Math.round(p.totalExpenses).toLocaleString('ru-RU')} ₽</td>
                         <td style={{ color: p.periodProfit < 0 ? 'var(--bad)' : 'inherit', fontWeight: isLoss ? 600 : 400 }}>
                           {Math.round(p.periodProfit).toLocaleString('ru-RU')} ₽
@@ -347,8 +321,6 @@ export default async function ProductsPage({
                         <td style={{ color: p.periodMargin !== null && p.periodMargin < 0 ? 'var(--bad)' : 'inherit', fontWeight: 600 }}>
                           {p.periodMargin === null ? '—' : (p.periodMargin * 100).toFixed(1) + '%'}
                         </td>
-                        <td style={{ color: 'var(--text-muted)' }}>{p.unitMargin === null ? '—' : (p.unitMargin * 100).toFixed(1) + '%'}</td>
-                        <td style={{ color: 'var(--text-muted)' }}>{p.unitMarginPeriod === null ? '—' : (p.unitMarginPeriod * 100).toFixed(1) + '%'}</td>
                         <td>
                           {p.flag ? (
                             <span className={`pill ${p.flag}`} title={p.reason}>
@@ -376,6 +348,7 @@ export default async function ProductsPage({
                     <td>{Math.round(totals.logisticsFee).toLocaleString('ru-RU')} ₽</td>
                     <td>{Math.round(totals.handlingFee).toLocaleString('ru-RU')} ₽</td>
                     <td>{Math.round(totals.otherFee).toLocaleString('ru-RU')} ₽</td>
+                    <td style={{ fontVariantNumeric: 'tabular-nums' }}>{Math.round(totals.taxAmount).toLocaleString('ru-RU')} ₽</td>
                     <td>{Math.round(totals.totalExpenses).toLocaleString('ru-RU')} ₽</td>
                     <td style={{ color: totals.periodProfit < 0 ? 'var(--bad)' : 'inherit' }}>
                       {Math.round(totals.periodProfit).toLocaleString('ru-RU')} ₽
@@ -383,8 +356,6 @@ export default async function ProductsPage({
                     <td style={{ color: totalMargin !== null && totalMargin < 0 ? 'var(--bad)' : 'inherit' }}>
                       {totalMargin === null ? '—' : (totalMargin * 100).toFixed(1) + '%'}
                     </td>
-                    <td></td>
-                    <td></td>
                     <td></td>
                   </tr>
                 </tfoot>

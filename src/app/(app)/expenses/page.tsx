@@ -53,6 +53,7 @@ export default async function ExpensesPage({
     .filter((p) => p.quantitySold > 0)
     .sort((a, b) => b.cogsFromTx - a.cogsFromTx);
   const totalCogs = soldProducts.reduce((s, p) => s + p.cogsFromTx, 0);
+  const totalTax = soldProducts.reduce((s, p) => s + p.taxAmount, 0);
   const totalQuantitySold = soldProducts.reduce((s, p) => s + p.quantitySold, 0);
   const missingCostCount = soldProducts.filter((p) => p.costPrice <= 0).length;
 
@@ -90,9 +91,10 @@ export default async function ExpensesPage({
         <h2>Товары: себестоимость проданного за период</h2>
         <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
           Себестоимость проданного = кол-во проданных штук товара за период × его себестоимость. Например,
-          13 продаж по 699 ₽ себестоимости = 13 × 699 ₽ = 9 087 ₽. Сумма по каждому товару ниже, и общий итог
-          — под таблицей. Показаны только товары с продажами за период; полный список товаров (включая без
-          продаж) и подробности по каждому — на странице «Товары».
+          13 продаж по 699 ₽ себестоимости = 13 × 699 ₽ = 9 087 ₽. Налог по товару = выручка по этому товару
+          × ставка налога проекта (0 ₽, если ставка не задана в настройках). Сумма по каждому товару ниже, и
+          общий итог — под таблицей. Показаны только товары с продажами за период; полный список товаров
+          (включая без продаж) и подробности по каждому — на странице «Товары».
         </p>
         {missingCostCount > 0 && (
           <p style={{ color: 'var(--warn, #b58900)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
@@ -114,6 +116,7 @@ export default async function ExpensesPage({
                   <th>Себестоимость, ₽/шт</th>
                   <th>Себестоимость проданного, ₽</th>
                   <th>Выручка, ₽</th>
+                  <th>Налог, ₽</th>
                   <th>Прибыль за период, ₽</th>
                 </tr>
               </thead>
@@ -130,6 +133,9 @@ export default async function ExpensesPage({
                         : '—'}
                     </td>
                     <td>{Math.round(p.revenue).toLocaleString('ru-RU')} ₽</td>
+                    <td style={{ fontVariantNumeric: 'tabular-nums' }}>
+                      {p.taxAmount > 0 ? Math.round(p.taxAmount).toLocaleString('ru-RU') + ' ₽' : p.taxRatePercent > 0 ? '0 ₽' : '—'}
+                    </td>
                     <td style={{ color: p.periodProfit < 0 ? 'var(--bad)' : 'inherit' }}>
                       {Math.round(p.periodProfit).toLocaleString('ru-RU')} ₽
                     </td>
@@ -144,6 +150,7 @@ export default async function ExpensesPage({
                   <td></td>
                   <td style={{ fontVariantNumeric: 'tabular-nums' }}>{Math.round(totalCogs).toLocaleString('ru-RU')} ₽</td>
                   <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{Math.round(totalTax).toLocaleString('ru-RU')} ₽</td>
                   <td></td>
                 </tr>
               </tfoot>
