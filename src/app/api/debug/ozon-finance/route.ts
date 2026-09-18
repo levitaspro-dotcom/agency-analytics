@@ -50,11 +50,16 @@ function dateRange(from: string, to: string): string[] {
   return out;
 }
 
-async function fetchAccrualTypeNames(clientId: string, apiKey: string): Promise<Map<number, string>> {
+async function fetchAccrualTypeNames(
+  clientId: string,
+  apiKey: string,
+): Promise<{ map: Map<number, string>; raw: unknown }> {
   const map = new Map<number, string>();
+  let raw: unknown = null;
   try {
     const { ok, json } = await ozonFetch(clientId, apiKey, '/v1/finance/accrual/types', { language: 'RU' });
-    if (!ok) return map;
+    raw = json;
+    if (!ok) return { map, raw };
     const list =
       (Array.isArray(json?.result) && json.result) ||
       (Array.isArray(json?.result?.types) && json.result.types) ||
@@ -69,7 +74,7 @@ async function fetchAccrualTypeNames(clientId: string, apiKey: string): Promise<
   } catch {
     // тихо игнорируем — это диагностика, не критично
   }
-  return map;
+  return { map, raw };
 }
 
 export async function GET(req: NextRequest) {
@@ -98,7 +103,7 @@ export async function GET(req: NextRequest) {
   const [fromYear, fromMonth] = from.split('-').map(Number);
   const results: Record<string, unknown> = {};
 
-  const typeNames = await fetchAccrualTypeNames(clientId, apiKey);
+  const { map: typeNames, raw: typeNamesRaw } = await fetchAccrualTypeNames(clientId, apiKey);
 
   // 1) /v1/finance/accrual/by-day по каждому дню периода — собираем все
   //    начисления, отдельно отмечаем NON_ITEM (не привязанные к отправлению)
@@ -134,28 +139,40 @@ export async function GET(req: NextRequest) {
       total: Math.round(v.total * 100) / 100,
       sample: v.sample,
     })),
+    typeNamesRawSample: typeNames.size === 0 ? typeNamesRaw : undefined,
   };
 
-  // 2) /v1/finance/mutual-settlement — по ошибке предыдущего прогона узнали точный
-  //    формат: поле "date" строкой "YYYY-MM" (не вложенный объект, не year/month)
+  // 2) /v1/finance/mutual-settlement — формат "date": "YYYY-MM" подтверждён (regex
+  //    прошёл), но за текущий месяц документа ещё нет (404 "finance document not
+  //    found") — пробуем и текущий, и предыдущий ЗАВЕРШЁННЫЙ месяц.
   const dateStr = `${fromYear}-${String(fromMonth).padStart(2, '0')}`;
+  const prevMonthDate0 = new Date(Date.UTC(fromYear, fromMonth - 2, 1)); // fromMonth is 1-based
+  const prevDateStr = `${prevMonthDate0.getUTCFullYear()}-${String(prevMonthDate0.getUTCMonth() + 1).padStart(2, '0')}`;
   try {
-    results.mutual_settlement = await ozonFetch(clientId, apiKey, '/v1/finance/mutual-settlement', {
+    results.mutual_settlement_current = await ozonFetch(clientId, apiKey, '/v1/finance/mutual-settlement', {
       date: dateStr,
     });
   } catch (e) {
-    results.mutual_settlement = { error: (e as Error).message };
+    results.mutual_settlement_current = { error: (e as Error).message };
+  }
+  try {
+    results.mutual_settlement_prev = await ozonFetch(clientId, apiKey, '/v1/finance/mutual-settlement', {
+      date: prevDateStr,
+    });
+  } catch (e) {
+    results.mutual_settlement_prev = { error: (e as Error).message };
   }
 
   // 3) /v2/finance/realization за прошлый ЗАВЕРШЁННЫЙ месяц (текущий может быть
   //    ещё не закрыт, отсюда "Report was not found" при первой попытке). Сворачиваем
   //    построчную разбивку в суммы по полям — интересуют bank_coinvestment (похоже на
   //    эквайринг) и pick_up_point_coinvestment (похоже на доставку до места выдачи).
-  const prevMonthDate = new Date(Date.UTC(fromYear, fromMonth - 2, 1)); // fromMonth is 1-based
+  //    ВАЖНО: реальные ключи JSON — латиницей (проверено по firstRow предыдущего
+  //    прогона), а не кириллицей, как в переводе документации — используем настоящие.
   try {
     const { ok, status, json } = await ozonFetch(clientId, apiKey, '/v2/finance/realization', {
-      year: prevMonthDate.getUTCFullYear(),
-      month: prevMonthDate.getUTCMonth() + 1,
+      year: prevMonthDate0.getUTCFullYear(),
+      month: prevMonthDate0.getUTCMonth() + 1,
     });
     if (ok && Array.isArray(json?.result?.rows)) {
       const rows: any[] = json.result.rows;
@@ -166,22 +183,22 @@ export async function GET(req: NextRequest) {
         sums[key] = Math.round(((sums[key] ?? 0) + n) * 100) / 100;
       };
       for (const row of rows) {
-        const kd = row?.комиссия_за_доставку ?? {};
+        const dc = row?.delivery_commission ?? {};
         for (const key of [
-          'сумма',
-          'компенсация',
-          'комиссия',
-          'бонус',
-          'стандартная_плата',
-          'итого',
-          'звезды',
-          'совместные_банковские_инвестиции',
-          'совместные_инвестиции_пункта_получения',
+          'amount',
+          'compensation',
+          'commission',
+          'bonus',
+          'standard_fee',
+          'total',
+          'stars',
+          'bank_coinvestment',
+          'pick_up_point_coinvestment',
         ]) {
-          addSum(`комиссия_за_доставку.${key}`, kd?.[key]);
+          addSum(`delivery_commission.${key}`, dc?.[key]);
         }
-        if (row?.возвратная_комиссия && typeof row.возвратная_комиссия === 'object') {
-          for (const [k, v] of Object.entries(row.возвратная_комиссия)) addSum(`возвратная_комиссия.${k}`, v);
+        if (row?.return_commission && typeof row.return_commission === 'object') {
+          for (const [k, v] of Object.entries(row.return_commission)) addSum(`return_commission.${k}`, v);
         }
       }
       results.realization_v2_prev_month = {
@@ -189,7 +206,6 @@ export async function GET(req: NextRequest) {
         rowCount: rows.length,
         header: json.result.header,
         fieldSums: sums,
-        firstRow: rows[0] ?? null,
       };
     } else {
       results.realization_v2_prev_month = { status, ok, json };
