@@ -9,12 +9,14 @@ import { decryptSecret } from '@/lib/crypto';
  * Цель: проверить на реальных данных Ольги (без угадывания по документации),
  * действительно ли Ozon Seller API отдаёт баллы за скидки / эквайринг /
  * программы партнёров / доставку до места выдачи через методы, которые наш
- * основной синк сейчас НЕ вызывает: /v1/finance/mutual-settlement и
- * /v1/finance/accrual/by-day (оба существуют в официальном API, в отличие от
- * /v1/finance/accrual/postings, который мы используем и который эти категории
- * не отдаёт вовсе, — но не тестировались нами напрямую).
+ * основной синк сейчас НЕ вызывает.
  *
- * Использование: GET /api/debug/ozon-finance?storeId=...&from=2026-09-01&to=2026-09-17
+ * v2 этого роута: /v1/finance/accrual/by-day уже подтверждён рабочим (200,
+ * реальные NON_ITEM-начисления, не привязанные к отправлению) — теперь
+ * прогоняем весь период по дням и расшифровываем type_id через
+ * /v1/finance/accrual/types. Также чиним формат запроса mutual-settlement.
+ *
+ * Использование: GET /api/debug/ozon-finance?projectId=...&from=2026-09-01&to=2026-09-17
  * Удалить после того, как вопрос будет закрыт.
  */
 
@@ -35,6 +37,39 @@ async function ozonFetch(clientId: string, apiKey: string, path: string, body: u
     json = text;
   }
   return { status: res.status, ok: res.ok, json };
+}
+
+function dateRange(from: string, to: string): string[] {
+  const out: string[] = [];
+  const cur = new Date(`${from}T00:00:00.000Z`);
+  const end = new Date(`${to}T00:00:00.000Z`);
+  while (cur <= end) {
+    out.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return out;
+}
+
+async function fetchAccrualTypeNames(clientId: string, apiKey: string): Promise<Map<number, string>> {
+  const map = new Map<number, string>();
+  try {
+    const { ok, json } = await ozonFetch(clientId, apiKey, '/v1/finance/accrual/types', { language: 'RU' });
+    if (!ok) return map;
+    const list =
+      (Array.isArray(json?.result) && json.result) ||
+      (Array.isArray(json?.result?.types) && json.result.types) ||
+      (Array.isArray(json?.types) && json.types) ||
+      (Array.isArray(json) && json) ||
+      [];
+    for (const item of list) {
+      const id = item?.type_id ?? item?.id;
+      const name = item?.name ?? item?.title ?? item?.type_name;
+      if (id !== undefined && name) map.set(Number(id), String(name));
+    }
+  } catch {
+    // тихо игнорируем — это диагностика, не критично
+  }
+  return map;
 }
 
 export async function GET(req: NextRequest) {
@@ -60,43 +95,68 @@ export async function GET(req: NextRequest) {
   const clientId = store.ozonClientId;
   const apiKey = decryptSecret(store.ozonApiKeyEncrypted);
 
-  // date-only YYYY-MM-DD -> границы дня в UTC, как ожидает Ozon
-  const fromIso = `${from}T00:00:00.000Z`;
-  const toIso = `${to}T23:59:59.999Z`;
   const [fromYear, fromMonth] = from.split('-').map(Number);
-  const [toYear, toMonth] = to.split('-').map(Number);
-
   const results: Record<string, unknown> = {};
 
-  // 1) /v1/finance/mutual-settlement — «Отчёт о взаиморасчётах», месячный,
-  //    по описанию должен включать эквайринг/продвижение отдельными строками
+  const typeNames = await fetchAccrualTypeNames(clientId, apiKey);
+
+  // 1) /v1/finance/accrual/by-day по каждому дню периода — собираем все
+  //    начисления, отдельно отмечаем NON_ITEM (не привязанные к отправлению)
+  const allAccruals: any[] = [];
+  const byDayErrors: Record<string, unknown> = {};
+  for (const day of dateRange(from, to)) {
+    const { ok, status, json } = await ozonFetch(clientId, apiKey, '/v1/finance/accrual/by-day', { date: day });
+    if (ok && Array.isArray(json?.accruals)) {
+      allAccruals.push(...json.accruals);
+    } else if (!ok) {
+      byDayErrors[day] = { status, json };
+    }
+  }
+  const nonItem = allAccruals.filter((a) => a?.accrued_category === 'NON_ITEM');
+  const nonItemByType = new Map<number, { count: number; total: number; sample: any }>();
+  for (const a of nonItem) {
+    const typeId = Number(a?.non_item_fee?.type_id ?? a?.item_fees?.[0]?.type_id ?? -1);
+    const amount = Number(a?.total_amount?.amount ?? 0);
+    const entry = nonItemByType.get(typeId) ?? { count: 0, total: 0, sample: a };
+    entry.count += 1;
+    entry.total += amount;
+    nonItemByType.set(typeId, entry);
+  }
+  results.accrual_by_day = {
+    totalDays: dateRange(from, to).length,
+    totalAccruals: allAccruals.length,
+    totalNonItem: nonItem.length,
+    errors: Object.keys(byDayErrors).length ? byDayErrors : undefined,
+    nonItemByType: Array.from(nonItemByType.entries()).map(([typeId, v]) => ({
+      typeId,
+      typeName: typeNames.get(typeId) ?? null,
+      count: v.count,
+      total: Math.round(v.total * 100) / 100,
+      sample: v.sample,
+    })),
+  };
+
+  // 2) /v1/finance/mutual-settlement — пробуем без вложенного "date", year/month как есть
   try {
     results.mutual_settlement = await ozonFetch(clientId, apiKey, '/v1/finance/mutual-settlement', {
-      date: { year: fromYear, month: fromMonth },
+      year: fromYear,
+      month: fromMonth,
     });
   } catch (e) {
     results.mutual_settlement = { error: (e as Error).message };
   }
 
-  // 2) /v1/finance/accrual/by-day — официальная замена /v3/finance/transaction/list,
-  //    агрегирует по дню, не привязан к конкретному отправлению
+  // 3) /v2/finance/realization за прошлый ЗАВЕРШЁННЫЙ месяц (текущий может быть
+  //    ещё не закрыт, отсюда "Report was not found" при первой попытке)
+  const prevMonthDate = new Date(Date.UTC(fromYear, fromMonth - 2, 1)); // fromMonth is 1-based
   try {
-    results.accrual_by_day = await ozonFetch(clientId, apiKey, '/v1/finance/accrual/by-day', {
-      date: from,
+    results.realization_v2_prev_month = await ozonFetch(clientId, apiKey, '/v2/finance/realization', {
+      year: prevMonthDate.getUTCFullYear(),
+      month: prevMonthDate.getUTCMonth() + 1,
     });
   } catch (e) {
-    results.accrual_by_day = { error: (e as Error).message };
+    results.realization_v2_prev_month = { error: (e as Error).message };
   }
 
-  // 3) /v2/finance/realization — «Отчёт о реализации товаров v2»
-  try {
-    results.realization_v2 = await ozonFetch(clientId, apiKey, '/v2/finance/realization', {
-      year: fromYear,
-      month: fromMonth,
-    });
-  } catch (e) {
-    results.realization_v2 = { error: (e as Error).message };
-  }
-
-  return NextResponse.json({ storeId, from, to, results }, { status: 200 });
+  return NextResponse.json({ storeId: store.id, from, to, results }, { status: 200 });
 }
