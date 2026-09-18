@@ -275,7 +275,12 @@ async function fetchAccrualTypeNames(creds: OzonCredentials): Promise<{ map: Map
     if (list) {
       for (const t of list) {
         const id = t?.type_id ?? t?.id ?? t?.code;
-        const name = t?.name ?? t?.name_ru ?? t?.title ?? t?.title_ru ?? t?.type_name ?? t?.description;
+        // Реальный формат ответа (проверено на живых данных): { id, name, description } —
+        // "name" — это внутренний английский код Ozon (например "Acquiring", "PayPerClick"),
+        // а человекочитаемое русское название — в "description" (например "Эквайринг",
+        // "Оплата за клик"). Раньше здесь сначала брали "name" — на карточках товаров и в
+        // «Расходах» вместо русских названий показывались английские коды.
+        const name = t?.description ?? t?.name_ru ?? t?.title_ru ?? t?.name ?? t?.title ?? t?.type_name;
         if (id !== undefined && id !== null && name) map.set(Number(id), String(name));
       }
       if (map.size > 0) return { map, diagnostic: null };
@@ -337,6 +342,83 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
   return rows;
 }
 
+/** Все даты периода (включительно), в формате YYYY-MM-DD — для методов, принимающих один день за раз. */
+function dateRangeDays(dateFrom: Date, dateTo: Date): string[] {
+  const out: string[] = [];
+  const cur = new Date(Date.UTC(dateFrom.getUTCFullYear(), dateFrom.getUTCMonth(), dateFrom.getUTCDate()));
+  const end = new Date(Date.UTC(dateTo.getUTCFullYear(), dateTo.getUTCMonth(), dateTo.getUTCDate()));
+  while (cur <= end) {
+    out.push(cur.toISOString().slice(0, 10));
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return out;
+}
+
+/**
+ * Забирает «периодические» начисления Ozon — те, что НЕ привязаны ни к какому отправлению
+ * (в ответе Ozon это accrued_category: "NON_ITEM"): реклама (оплата за клик), эквайринг,
+ * доставка до места выдачи, кросс-докинг и подобные сборы. Метод /v1/finance/accrual/postings
+ * выше в принципе не может их увидеть — он опрашивает начисления ПО КОНКРЕТНЫМ отправлениям,
+ * а эти сборы к отправлениям не привязаны вовсе.
+ *
+ * Раньше эти категории нигде в приложении не отражались — обнаружено и подтверждено на
+ * реальном примере (магазин ИННОВИО, сентябрь 2026): начисления с этими категориями
+ * реально есть у Ozon, но ни разу не появлялись в «Расходах». Отдельно проверено и НЕ
+ * подтверждено: баллы за скидки (программа лояльности покупателей) — по полному списку из
+ * 124 типов начислений (/v1/finance/accrual/types) подходящей категории для них нет вообще;
+ * похоже, это единственная категория, для которой у Ozon действительно нет API — остаётся
+ * только ручной импорт официального xlsx-отчёта, если понадобится.
+ *
+ * Метод /v1/finance/accrual/by-day принимает один календарный день за раз, а не диапазон —
+ * поэтому опрашиваем каждый день периода отдельно (при максимальном окне синхронизации в
+ * 60 дней, см. syncStoreAction, — не больше 60 дополнительных запросов).
+ *
+ * Так же, как и у /v1/finance/accrual/postings, разбор сделан защитно: ошибка по
+ * конкретному дню не обрушивает всю синхронизацию (основная выручка и посвязанные с
+ * отправлениями сборы к этому моменту уже собраны), а просто не добавляет данные за этот
+ * день — причина попадает в notes итогового сообщения.
+ */
+async function fetchNonItemAccruals(
+  creds: OzonCredentials,
+  dateFrom: Date,
+  dateTo: Date,
+  typeNames: Map<number, string>,
+): Promise<{ operations: OzonOperation[]; errors: string[] }> {
+  const operations: OzonOperation[] = [];
+  const errors: string[] = [];
+  for (const day of dateRangeDays(dateFrom, dateTo)) {
+    const { ok, status, json } = await ozonFetch(creds, '/v1/finance/accrual/by-day', { date: day });
+    if (!ok) {
+      errors.push(`${day}: ${ozonErrorMessage(status, json)}`);
+      continue;
+    }
+    const accruals: any[] = Array.isArray(json?.accruals) ? json.accruals : [];
+    for (const a of accruals) {
+      if (!a || a.accrued_category !== 'NON_ITEM') continue;
+      const typeId = a.non_item_fee?.type_id;
+      const amount = Number(a.total_amount?.amount ?? a.non_item_fee?.accrued?.amount) || 0;
+      if (amount === 0) continue;
+      const operation_date = a.date ?? day;
+      const operation_type_name =
+        (typeId !== undefined && typeNames.get(Number(typeId))) || `Тип начисления ${typeId ?? '?'}`;
+      operations.push({
+        operation_id: `nonitem:${a.accrual_id ?? `${day}:${typeId}`}`,
+        operation_type: String(typeId ?? 'unknown'),
+        operation_type_name,
+        operation_date,
+        accruals_for_sale: amount > 0 ? amount : 0,
+        amount,
+        // Намеренно без sku/postingNumber — эти начисления в принципе не привязаны к
+        // конкретному товару или отправлению, поэтому ниже (в syncStoreAction) они лягут
+        // в общие «Расходы»/«Обзор» без разбивки по товару, как и любая другая операция
+        // без привязки — это не потеря данных, а честное отражение того, что сбор
+        // периодический, а не позаказный.
+      });
+    }
+  }
+  return { operations, errors };
+}
+
 /**
  * Забирает финансовые операции Ozon (продажи, комиссии, логистика, возвраты и т.д.)
  * за период. Себестоимость и налоги Ozon не знает — они остаются на стороне приложения.
@@ -346,7 +428,10 @@ function flattenPostingAccruals(postingAccruals: any[], typeNames: Map<number, s
  * устроена иначе: принимает не диапазон дат, а конкретный список номеров отправлений
  * (posting_numbers, не больше 200 за раз). Поэтому сначала собираем номера отправлений
  * за период через стабильные методы списков FBS/FBO, а затем батчами запрашиваем по
- * ним начисления.
+ * ним начисления. Отдельно, через /v1/finance/accrual/by-day (см. fetchNonItemAccruals
+ * выше), добираем периодические начисления, которые ни к какому отправлению не привязаны
+ * и поэтому methods/accrual/postings в принципе не видит — рекламу, эквайринг, доставку до
+ * места выдачи и т.п.
  *
  * Разбор ответа сделан защитно: если формат ответа не совпадёт с ожидаемым — синхронизация
  * не притворится «успешной с нулём операций», а вернёт ok:false с диагностикой реальной
@@ -427,11 +512,19 @@ export async function fetchOzonFinanceTransactions(
     };
   }
 
+  // Периодические начисления (реклама, эквайринг, доставка до места выдачи и т.п.) —
+  // не привязаны к отправлению, поэтому добираются отдельным методом. Ошибка здесь не
+  // должна ронять уже собранные выручку/себестоимость/позаказные сборы — только теряется
+  // именно эта дополнительная категория, и это видно в notes ниже.
+  const { operations: nonItemOps, errors: nonItemErrors } = await fetchNonItemAccruals(creds, dateFrom, dateTo, typeNames);
+  operations.push(...nonItemOps);
+
   const notePosting = postingErrors.length > 0 ? ` (не удалось проверить часть отправлений: ${postingErrors.join('; ')})` : '';
   const noteTypeNames = typeNamesDiagnostic ? ` · названия категорий не распознаны (${typeNamesDiagnostic})` : '';
+  const noteNonItem = nonItemErrors.length > 0 ? ` · периодические начисления получены не за все дни (${nonItemErrors.length} из ${dateRangeDays(dateFrom, dateTo).length} дней с ошибкой)` : '';
   return {
     ok: true,
-    message: `Отправлений за период: ${postingNumbers.length}. Товарных строк (выручка): ${productLines.length}. Расходных операций: ${operations.length}${notePosting}${noteTypeNames}`,
+    message: `Отправлений за период: ${postingNumbers.length}. Товарных строк (выручка): ${productLines.length}. Расходных операций: ${operations.length - nonItemOps.length}. Периодических начислений (реклама/эквайринг/доставка и т.п., не по отправлениям): ${nonItemOps.length}${notePosting}${noteTypeNames}${noteNonItem}`,
     operations,
     productLines,
   };
