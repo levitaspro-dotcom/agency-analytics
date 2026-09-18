@@ -1,6 +1,6 @@
 import { requireUser, listAccessibleProjects, assertProjectAccess, isManagerOrAbove } from '@/lib/authz';
 import { resolvePeriod } from '@/lib/period';
-import { computeProductInsights } from '@/lib/finance';
+import { computeProductInsights, dateWhere, type DateBasis } from '@/lib/finance';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
 import { updateProductCostAction } from '../projects/page';
@@ -18,6 +18,7 @@ export default async function ProductsPage({
     q?: string;
     status?: string;
     sort?: string;
+    dateBasis?: string;
   };
 }) {
   const user = await requireUser();
@@ -29,13 +30,14 @@ export default async function ProductsPage({
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
   const canEdit = isManagerOrAbove(user.role);
+  const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
 
   const SORT_VALUES = ['margin_asc', 'margin_desc', 'margin_period_asc', 'margin_period_desc'] as const;
   const q = (searchParams.q || '').trim();
   const status = searchParams.status === 'selling' || searchParams.status === 'not_selling' ? searchParams.status : '';
   const sort = (SORT_VALUES as readonly string[]).includes(searchParams.sort || '') ? (searchParams.sort as (typeof SORT_VALUES)[number]) : '';
 
-  const allProducts = await computeProductInsights({ projectId, storeId, from, to });
+  const allProducts = await computeProductInsights({ projectId, storeId, from, to, dateBasis });
 
   // Диагностика для менеджеров: операции за период, которые не удалось привязать ни к одному
   // товару (сумма нигде не пропадает — она всё ещё учтена в «Расходах»/«Обзоре», но не видна на
@@ -48,7 +50,7 @@ export default async function ProductsPage({
           ...(storeId ? { storeId } : {}),
           productId: null,
           type: { in: ['REVENUE', 'OZON_FEE'] },
-          date: { gte: from, lte: to },
+          ...dateWhere(dateBasis, from, to),
         },
         orderBy: { amount: 'desc' },
         take: 30,
@@ -93,7 +95,7 @@ export default async function ProductsPage({
 
   return (
     <div>
-      <FilterBar basePath="/products" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
+      <FilterBar basePath="/products" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} dateBasis={dateBasis} />
       <div className="panel">
         <h2>Товары за период</h2>
         {allProducts.length === 0 ? (
@@ -121,11 +123,19 @@ export default async function ProductsPage({
               кол-во шт). Ozon часто меняет цену/скидки, поэтому они могут заметно расходиться — «по факту»
               точнее отражает, сколько реально заработано на выбранный период.
             </p>
+            {dateBasis === 'accrual' && (
+              <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
+                Период сейчас считается «по дате начисления Ozon» (переключатель «Магазин» вверху) — так же, как в
+                официальных отчётах Ozon. У части старых операций дата начисления ещё не дозаполнена — они
+                попадают в период по дате заказа, пока не пересинхронизируетесь.
+              </p>
+            )}
             <form method="get" action="/products" className="topbar" style={{ marginBottom: 16, paddingBottom: 16 }}>
               <input type="hidden" name="projectId" value={projectId} />
               {storeId && <input type="hidden" name="storeId" value={storeId} />}
               <input type="hidden" name="from" value={searchParams.from ?? ''} />
               <input type="hidden" name="to" value={searchParams.to ?? ''} />
+              <input type="hidden" name="dateBasis" value={dateBasis} />
               <div className="field">
                 <label>Название или SKU</label>
                 <input type="text" name="q" defaultValue={q} placeholder="например, Кисель или 5342414889" style={{ minWidth: 220 }} />
@@ -154,7 +164,7 @@ export default async function ProductsPage({
               {filtersActive && (
                 <a
                   className="btn"
-                  href={`/products?projectId=${projectId}${storeId ? `&storeId=${storeId}` : ''}&from=${searchParams.from ?? ''}&to=${searchParams.to ?? ''}`}
+                  href={`/products?projectId=${projectId}${storeId ? `&storeId=${storeId}` : ''}&from=${searchParams.from ?? ''}&to=${searchParams.to ?? ''}&dateBasis=${dateBasis}`}
                 >
                   Сбросить
                 </a>

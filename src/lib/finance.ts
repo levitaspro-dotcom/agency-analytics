@@ -18,6 +18,24 @@ export interface FinanceSummary {
   taxRatePercent: number;
 }
 
+export type DateBasis = 'order' | 'accrual';
+
+/**
+ * Период можно считать по двум разным датам: «по дате заказа» (когда покупатель оформил
+ * заказ — так исторически считало приложение) или «по дате начисления Ozon» (когда площадка
+ * фактически провела начисление по отправлению — так считают официальные отчёты Ozon,
+ * например «Отчёт по начислениям», и начисление обычно приходит на несколько дней позже
+ * оформления заказа). Для строк, у которых собственной даты начисления ещё нет (см. комментарий
+ * у accrualDate в schema.prisma — дозаполняется на следующей синхронизации), используем дату
+ * заказа как запасной вариант, чтобы такие строки не выпадали из подсчёта молча.
+ */
+export function dateWhere(basis: DateBasis, from: Date, to: Date) {
+  if (basis === 'order') return { date: { gte: from, lte: to } };
+  return {
+    OR: [{ accrualDate: { gte: from, lte: to } }, { accrualDate: null, date: { gte: from, lte: to } }],
+  };
+}
+
 function sumByCategory(rows: { category: string; amount: number }[]): CategoryBreakdown {
   const map = new Map<string, number>();
   for (const r of rows) map.set(r.category, (map.get(r.category) ?? 0) + r.amount);
@@ -31,14 +49,15 @@ export async function computeFinanceSummary(params: {
   storeId?: string;
   from: Date;
   to: Date;
+  dateBasis?: DateBasis;
 }): Promise<FinanceSummary> {
-  const { projectId, storeId, from, to } = params;
+  const { projectId, storeId, from, to, dateBasis = 'order' } = params;
   const [rows, project] = await Promise.all([
     prisma.financeTransaction.findMany({
       where: {
         projectId,
         ...(storeId ? { storeId } : {}),
-        date: { gte: from, lte: to },
+        ...dateWhere(dateBasis, from, to),
       },
       select: { type: true, category: true, amount: true },
     }),
@@ -149,8 +168,9 @@ export async function computeProductInsights(params: {
   storeId?: string;
   from: Date;
   to: Date;
+  dateBasis?: DateBasis;
 }): Promise<ProductInsight[]> {
-  const { projectId, storeId, from, to } = params;
+  const { projectId, storeId, from, to, dateBasis = 'order' } = params;
   // active:true — не показываем товары, которых больше нет в текущем каталоге Ozon этого
   // магазина (сняты с продажи или остались от ранее подключённого другого Ozon-аккаунта).
   const products = await prisma.product.findMany({ where: { projectId, active: true, ...(storeId ? { storeId } : {}) } });
@@ -158,7 +178,7 @@ export async function computeProductInsights(params: {
 
   const txs = productIds.length
     ? await prisma.financeTransaction.findMany({
-        where: { projectId, productId: { in: productIds }, date: { gte: from, lte: to } },
+        where: { projectId, productId: { in: productIds }, ...dateWhere(dateBasis, from, to) },
         select: { productId: true, type: true, amount: true, category: true, quantity: true },
       })
     : [];

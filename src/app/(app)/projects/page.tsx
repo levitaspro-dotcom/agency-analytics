@@ -597,6 +597,7 @@ async function syncStoreAction(formData: FormData) {
   let imported = 0;
   let backfilledQty = 0;
   let backfilledProductLink = 0;
+  let backfilledAccrualDate = 0;
   if (syncResult.ok) {
     const rows: {
       projectId: string;
@@ -607,8 +608,23 @@ async function syncStoreAction(formData: FormData) {
       amount: number;
       quantity?: number;
       date: Date;
+      accrualDate?: Date | null;
       externalId: string;
     }[] = [];
+
+    // Дата начисления Ozon по отправлению — берём из финансовых операций (op.operation_date —
+    // это и есть accrual_date, см. flattenPostingAccruals в ozon.ts). Строки выручки/себестоимости
+    // ниже датированы по дате ОФОРМЛЕНИЯ заказа (posting.products[]), а официальные отчёты Ozon
+    // (например, «Отчёт по начислениям») считают период по дате НАЧИСЛЕНИЯ — она обычно на
+    // несколько дней позже даты заказа, поэтому суммы за один и тот же период могут не совпадать
+    // один в один. Сохраняем обе даты, чтобы на «Товары» можно было выбрать, по какой считать.
+    const postingAccrualDate = new Map<string, Date>();
+    for (const op of syncResult.operations) {
+      if (!op.postingNumber || postingAccrualDate.has(op.postingNumber)) continue;
+      const d = new Date(op.operation_date);
+      if (!isNaN(d.getTime())) postingAccrualDate.set(op.postingNumber, d);
+    }
+    const lineRows: typeof rows = [];
 
     // Выручка и себестоимость — из состава заказа (posting.products[]: артикул, количество,
     // цена за единицу). Финансовый метод Ozon (/v1/finance/accrual/postings, ниже) надёжно
@@ -644,7 +660,9 @@ async function syncStoreAction(formData: FormData) {
       const revenue = line.price * line.quantity;
       if (revenue <= 0) continue;
 
-      rows.push({
+      const accrualDate = postingAccrualDate.get(line.postingNumber) ?? null;
+
+      lineRows.push({
         projectId: store.projectId,
         storeId: store.id,
         productId,
@@ -653,12 +671,13 @@ async function syncStoreAction(formData: FormData) {
         amount: revenue,
         quantity: line.quantity,
         date,
+        accrualDate,
         externalId: `${line.postingNumber}:${lineKey ?? 'x'}:revenue`,
       });
 
       const costPrice = productId ? productCostPriceById.get(productId) : undefined;
       if (productId && costPrice && costPrice > 0) {
-        rows.push({
+        lineRows.push({
           projectId: store.projectId,
           storeId: store.id,
           productId,
@@ -666,6 +685,7 @@ async function syncStoreAction(formData: FormData) {
           category: 'Себестоимость проданных товаров',
           amount: costPrice * line.quantity,
           date,
+          accrualDate,
           externalId: `${line.postingNumber}:${lineKey ?? 'x'}:cogs`,
         });
       }
@@ -702,7 +722,10 @@ async function syncStoreAction(formData: FormData) {
     // задним числом восстановилась (см. postingProductRevenue выше), старая безтоварная
     // строка осталась бы в базе, а новая (или разбитая) добавилась бы поверх — сумма
     // задвоилась бы.
-    const opRowsByBase = new Map<string, { productId: string | null; type: 'OZON_FEE' | 'REVENUE'; category: string; amount: number; date: Date; externalId: string }[]>();
+    const opRowsByBase = new Map<
+      string,
+      { productId: string | null; type: 'OZON_FEE' | 'REVENUE'; category: string; amount: number; date: Date; accrualDate: Date; externalId: string }[]
+    >();
     for (const op of syncResult.operations) {
       const date = new Date(op.operation_date);
       const net = op.amount || 0;
@@ -726,7 +749,9 @@ async function syncStoreAction(formData: FormData) {
       }
 
       if (directProductId) {
-        opRowsByBase.set(externalIdBase, [{ productId: directProductId, type, category, amount: amountAbs, date, externalId: externalIdBase }]);
+        opRowsByBase.set(externalIdBase, [
+          { productId: directProductId, type, category, amount: amountAbs, date, accrualDate: date, externalId: externalIdBase },
+        ]);
         continue;
       }
 
@@ -744,6 +769,7 @@ async function syncStoreAction(formData: FormData) {
             category,
             amount: amountAbs * (revenue / totalRevenue),
             date,
+            accrualDate: date,
             externalId: `${externalIdBase}:${productId}`,
           })),
         );
@@ -753,7 +779,9 @@ async function syncStoreAction(formData: FormData) {
       // Совсем не удалось привязать (отправление не найдено среди productLines за этот
       // период, например возврат по заказу из более раннего периода) — сохраняем без
       // товара, как раньше, чтобы сумма не терялась хотя бы в общих расходах.
-      opRowsByBase.set(externalIdBase, [{ productId: null, type, category, amount: amountAbs, date, externalId: externalIdBase }]);
+      opRowsByBase.set(externalIdBase, [
+        { productId: null, type, category, amount: amountAbs, date, accrualDate: date, externalId: externalIdBase },
+      ]);
     }
 
     // Сверяем с уже сохранёнными строками этих же операций (по базовому externalId).
@@ -761,7 +789,7 @@ async function syncStoreAction(formData: FormData) {
     const existingOpRows = opBaseIds.length
       ? await prisma.financeTransaction.findMany({
           where: { storeId: store.id, externalId: { in: opBaseIds } },
-          select: { id: true, externalId: true, productId: true },
+          select: { id: true, externalId: true, productId: true, accrualDate: true },
         })
       : [];
     const existingOpByBase = new Map(existingOpRows.map((e) => [e.externalId as string, e]));
@@ -773,10 +801,13 @@ async function syncStoreAction(formData: FormData) {
         const candidate = candidateRows[0];
         if (existing) {
           // Строка с таким externalId уже есть (была сохранена раньше, возможно ещё без
-          // привязки к товару). Новую не добавляем — только дозаполняем привязку, если
-          // раньше её не было, а теперь появилась.
-          if (existing.productId == null && candidate.productId != null) {
-            await prisma.financeTransaction.update({ where: { id: existing.id }, data: { productId: candidate.productId } });
+          // привязки к товару/даты начисления). Новую не добавляем — только дозаполняем то,
+          // чего раньше не было.
+          const patch: { productId?: string; accrualDate?: Date } = {};
+          if (existing.productId == null && candidate.productId != null) patch.productId = candidate.productId;
+          if (existing.accrualDate == null && candidate.accrualDate != null) patch.accrualDate = candidate.accrualDate;
+          if (Object.keys(patch).length > 0) {
+            await prisma.financeTransaction.update({ where: { id: existing.id }, data: patch });
           }
         } else {
           rows.push({ projectId: store.projectId, storeId: store.id, ...candidate });
@@ -794,41 +825,42 @@ async function syncStoreAction(formData: FormData) {
       }
     }
 
-    // Строки выручки, синхронизированные ещё до появления поля quantity (или до починки
-    // привязки по offer_id выше), уже лежат в базе (createMany со skipDuplicates их не
-    // тронет — задваивать нечего, но и quantity/productId сами не появятся). Раз уж период
-    // пересинхронизируется, заодно бесшумно дозаполняем то, чего раньше не было:
-    // quantity — чтобы «Кол-во, шт» не показывало пусто по старым продажам, и productId —
-    // чтобы продажи, ранее «потерянные» из-за смены SKU, задним числом вернулись к своему
-    // товару на странице «Товары» (без повторной синхронизации истории — сумма та же,
-    // просто теперь видна по товару).
-    const revenueRowsWithQty = rows.filter((r) => r.type === 'REVENUE' && r.quantity !== undefined);
-    const otherRows = rows.filter((r) => !(r.type === 'REVENUE' && r.quantity !== undefined));
-    const newRevenueRows: typeof rows = [];
-    if (revenueRowsWithQty.length > 0) {
+    // Строки выручки/себестоимости из состава заказа (lineRows), синхронизированные ещё до
+    // появления поля quantity, до починки привязки по offer_id или до появления accrualDate,
+    // уже лежат в базе (createMany со skipDuplicates их не тронет — задваивать нечего, но и
+    // недостающие поля сами не появятся). Раз уж период пересинхронизируется, заодно бесшумно
+    // дозаполняем то, чего раньше не было: quantity — чтобы «Кол-во, шт» не показывало пусто по
+    // старым продажам, productId — чтобы продажи, ранее «потерянные» из-за смены SKU, задним
+    // числом вернулись к своему товару, и accrualDate — чтобы старые строки тоже попадали в
+    // подсчёт «по дате начисления» на «Товары» (без повторной синхронизации истории — суммы те
+    // же, просто дозаполняются недостающие поля).
+    const newLineRows: typeof rows = [];
+    if (lineRows.length > 0) {
       const existing = await prisma.financeTransaction.findMany({
-        where: { storeId: store.id, externalId: { in: revenueRowsWithQty.map((r) => r.externalId) } },
-        select: { id: true, externalId: true, quantity: true, productId: true },
+        where: { storeId: store.id, externalId: { in: lineRows.map((r) => r.externalId) } },
+        select: { id: true, externalId: true, quantity: true, productId: true, accrualDate: true },
       });
       const existingByExternalId = new Map(existing.map((e) => [e.externalId as string, e]));
-      for (const r of revenueRowsWithQty) {
+      for (const r of lineRows) {
         const match = existingByExternalId.get(r.externalId);
         if (!match) {
-          newRevenueRows.push(r);
+          newLineRows.push(r);
           continue;
         }
-        const patch: { quantity?: number; productId?: string } = {};
+        const patch: { quantity?: number; productId?: string; accrualDate?: Date } = {};
         if (match.quantity == null && r.quantity != null) patch.quantity = r.quantity;
         if (match.productId == null && r.productId != null) patch.productId = r.productId;
+        if (match.accrualDate == null && r.accrualDate != null) patch.accrualDate = r.accrualDate;
         if (Object.keys(patch).length > 0) {
           await prisma.financeTransaction.update({ where: { id: match.id }, data: patch });
           if (patch.quantity !== undefined) backfilledQty += 1;
           if (patch.productId !== undefined) backfilledProductLink += 1;
+          if (patch.accrualDate !== undefined) backfilledAccrualDate += 1;
         }
       }
     }
 
-    const allNewRows = [...otherRows, ...newRevenueRows];
+    const allNewRows = [...rows, ...newLineRows];
     if (allNewRows.length > 0) {
       const created = await prisma.financeTransaction.createMany({ data: allNewRows, skipDuplicates: true });
       imported = created.count;
@@ -838,7 +870,7 @@ async function syncStoreAction(formData: FormData) {
   const parts = [
     productsResult.ok ? `товаров: ${productsResult.products.length} (новых: ${productsImported})` : `товары — ошибка: ${productsResult.message}`,
     syncResult.ok
-      ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}${backfilledProductLink > 0 ? ` · привязка к товару восстановлена у ${backfilledProductLink} старых строк` : ''}`
+      ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}${backfilledProductLink > 0 ? ` · привязка к товару восстановлена у ${backfilledProductLink} старых строк` : ''}${backfilledAccrualDate > 0 ? ` · дата начисления дозаполнена у ${backfilledAccrualDate} старых строк` : ''}`
       : `операции — ошибка: ${syncResult.message}`,
   ];
   const overallOk = productsResult.ok && syncResult.ok;
