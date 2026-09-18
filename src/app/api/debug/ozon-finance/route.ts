@@ -136,24 +136,64 @@ export async function GET(req: NextRequest) {
     })),
   };
 
-  // 2) /v1/finance/mutual-settlement — пробуем без вложенного "date", year/month как есть
+  // 2) /v1/finance/mutual-settlement — по ошибке предыдущего прогона узнали точный
+  //    формат: поле "date" строкой "YYYY-MM" (не вложенный объект, не year/month)
+  const dateStr = `${fromYear}-${String(fromMonth).padStart(2, '0')}`;
   try {
     results.mutual_settlement = await ozonFetch(clientId, apiKey, '/v1/finance/mutual-settlement', {
-      year: fromYear,
-      month: fromMonth,
+      date: dateStr,
     });
   } catch (e) {
     results.mutual_settlement = { error: (e as Error).message };
   }
 
   // 3) /v2/finance/realization за прошлый ЗАВЕРШЁННЫЙ месяц (текущий может быть
-  //    ещё не закрыт, отсюда "Report was not found" при первой попытке)
+  //    ещё не закрыт, отсюда "Report was not found" при первой попытке). Сворачиваем
+  //    построчную разбивку в суммы по полям — интересуют bank_coinvestment (похоже на
+  //    эквайринг) и pick_up_point_coinvestment (похоже на доставку до места выдачи).
   const prevMonthDate = new Date(Date.UTC(fromYear, fromMonth - 2, 1)); // fromMonth is 1-based
   try {
-    results.realization_v2_prev_month = await ozonFetch(clientId, apiKey, '/v2/finance/realization', {
+    const { ok, status, json } = await ozonFetch(clientId, apiKey, '/v2/finance/realization', {
       year: prevMonthDate.getUTCFullYear(),
       month: prevMonthDate.getUTCMonth() + 1,
     });
+    if (ok && Array.isArray(json?.result?.rows)) {
+      const rows: any[] = json.result.rows;
+      const sums: Record<string, number> = {};
+      const addSum = (key: string, value: unknown) => {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n === 0) return;
+        sums[key] = Math.round(((sums[key] ?? 0) + n) * 100) / 100;
+      };
+      for (const row of rows) {
+        const kd = row?.комиссия_за_доставку ?? {};
+        for (const key of [
+          'сумма',
+          'компенсация',
+          'комиссия',
+          'бонус',
+          'стандартная_плата',
+          'итого',
+          'звезды',
+          'совместные_банковские_инвестиции',
+          'совместные_инвестиции_пункта_получения',
+        ]) {
+          addSum(`комиссия_за_доставку.${key}`, kd?.[key]);
+        }
+        if (row?.возвратная_комиссия && typeof row.возвратная_комиссия === 'object') {
+          for (const [k, v] of Object.entries(row.возвратная_комиссия)) addSum(`возвратная_комиссия.${k}`, v);
+        }
+      }
+      results.realization_v2_prev_month = {
+        status,
+        rowCount: rows.length,
+        header: json.result.header,
+        fieldSums: sums,
+        firstRow: rows[0] ?? null,
+      };
+    } else {
+      results.realization_v2_prev_month = { status, ok, json };
+    }
   } catch (e) {
     results.realization_v2_prev_month = { error: (e as Error).message };
   }
