@@ -379,8 +379,15 @@ const FINE_BUCKET_KEYS = [
 ] as const;
 export type FineFeeBucket = (typeof FINE_BUCKET_KEYS)[number];
 
+// translateCategory сначала — часть уже сохранённых строк (до того, как ozon.ts начал переводить
+// категории сам при синхронизации) до сих пор лежит в базе на английском (SaleCommission и т.п.),
+// а FINE_BUCKET_BY_CATEGORY выше ключи держит только русские. Без этого перевода такие строки
+// молча уезжали бы в «Прочие сборы» вместо своей настоящей категории — ровно та же ошибка, что
+// уже один раз ловили на FEE_BUCKET_BY_CATEGORY (см. комментарий там), решаем её здесь иначе —
+// централизованно, одним вызовом translateCategory, а не повторным дублированием английских
+// ключей в ещё одном словаре.
 function bucketFineCategory(category: string): FineFeeBucket {
-  return (FINE_BUCKET_BY_CATEGORY[category] as FineFeeBucket) ?? 'other';
+  return (FINE_BUCKET_BY_CATEGORY[translateCategory(category)] as FineFeeBucket) ?? 'other';
 }
 
 export interface ProductExpenseDetail extends ProductInsight {
