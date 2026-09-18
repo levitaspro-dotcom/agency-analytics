@@ -596,6 +596,7 @@ async function syncStoreAction(formData: FormData) {
 
   let imported = 0;
   let backfilledQty = 0;
+  let backfilledProductLink = 0;
   if (syncResult.ok) {
     const rows: {
       projectId: string;
@@ -613,10 +614,33 @@ async function syncStoreAction(formData: FormData) {
     // цена за единицу). Финансовый метод Ozon (/v1/finance/accrual/postings, ниже) надёжно
     // отдаёт только удержания — суммы самой продажи в нём нет, поэтому раньше «Выручка»
     // почти всегда оставалась нулевой при вполне реальных продажах и комиссиях.
+    //
+    // Привязка строки заказа к товару: пробуем сначала по offer_id (артикул продавца —
+    // стабилен между синхронизациями и не меняется при переиздании карточки), и только
+    // если его нет — по числовому SKU Ozon. Раньше было наоборот (сначала SKU), а SKU у
+    // Ozon может смениться для того же товара (например, после переиздания карточки) —
+    // тогда строки старых заказов несли уже не входящий в текущие алиасы товара SKU, и
+    // реальные продажи «терялись» на странице «Товары» (сумма при этом не пропадала
+    // совсем — без привязки к товару она попадала в общие «Расходы»/«Обзор», см. ниже).
+    const resolveLineProductId = (line: OzonPostingProductLine): string | null => {
+      if (line.offerId) {
+        const byOffer = productIdByAliasSku.get(line.offerId);
+        if (byOffer) return byOffer;
+      }
+      if (line.sku) {
+        const bySku = productIdByAliasSku.get(line.sku);
+        if (bySku) return bySku;
+      }
+      return null;
+    };
+
     for (const line of syncResult.productLines) {
       const date = new Date(line.date);
+      // Ключ externalId — как раньше (SKU, если есть, иначе offer_id): его нельзя менять
+      // задним числом, иначе уже сохранённые строки на пересинхронизации задвоятся.
+      // Привязка к товару (productId) теперь считается отдельно, через resolveLineProductId.
       const lineKey = line.sku ?? line.offerId;
-      const productId = lineKey ? productIdByAliasSku.get(lineKey) ?? null : null;
+      const productId = resolveLineProductId(line);
       const revenue = line.price * line.quantity;
       if (revenue <= 0) continue;
 
@@ -658,8 +682,7 @@ async function syncStoreAction(formData: FormData) {
     // выручке по каждому в этом отправлении.
     const postingProductRevenue = new Map<string, Map<string, number>>();
     for (const line of syncResult.productLines) {
-      const lineKey = line.sku ?? line.offerId;
-      const productId = lineKey ? productIdByAliasSku.get(lineKey) : undefined;
+      const productId = resolveLineProductId(line);
       const revenue = line.price * line.quantity;
       if (!productId || revenue <= 0) continue;
       const byProduct = postingProductRevenue.get(line.postingNumber) ?? new Map<string, number>();
@@ -771,27 +794,36 @@ async function syncStoreAction(formData: FormData) {
       }
     }
 
-    // Строки выручки, синхронизированные ещё до появления поля quantity, уже лежат в базе
-    // (createMany со skipDuplicates их не тронет — задваивать нечего, но и quantity само
-    // не появится). Раз уж период пересинхронизируется, заодно бесшумно дозаполняем quantity
-    // у уже сохранённых строк, чтобы «Кол-во, шт» на странице «Товары» не показывало пусто
-    // по старым продажам.
+    // Строки выручки, синхронизированные ещё до появления поля quantity (или до починки
+    // привязки по offer_id выше), уже лежат в базе (createMany со skipDuplicates их не
+    // тронет — задваивать нечего, но и quantity/productId сами не появятся). Раз уж период
+    // пересинхронизируется, заодно бесшумно дозаполняем то, чего раньше не было:
+    // quantity — чтобы «Кол-во, шт» не показывало пусто по старым продажам, и productId —
+    // чтобы продажи, ранее «потерянные» из-за смены SKU, задним числом вернулись к своему
+    // товару на странице «Товары» (без повторной синхронизации истории — сумма та же,
+    // просто теперь видна по товару).
     const revenueRowsWithQty = rows.filter((r) => r.type === 'REVENUE' && r.quantity !== undefined);
     const otherRows = rows.filter((r) => !(r.type === 'REVENUE' && r.quantity !== undefined));
     const newRevenueRows: typeof rows = [];
     if (revenueRowsWithQty.length > 0) {
       const existing = await prisma.financeTransaction.findMany({
         where: { storeId: store.id, externalId: { in: revenueRowsWithQty.map((r) => r.externalId) } },
-        select: { id: true, externalId: true, quantity: true },
+        select: { id: true, externalId: true, quantity: true, productId: true },
       });
       const existingByExternalId = new Map(existing.map((e) => [e.externalId as string, e]));
       for (const r of revenueRowsWithQty) {
         const match = existingByExternalId.get(r.externalId);
         if (!match) {
           newRevenueRows.push(r);
-        } else if (match.quantity == null && r.quantity != null) {
-          await prisma.financeTransaction.update({ where: { id: match.id }, data: { quantity: r.quantity } });
-          backfilledQty += 1;
+          continue;
+        }
+        const patch: { quantity?: number; productId?: string } = {};
+        if (match.quantity == null && r.quantity != null) patch.quantity = r.quantity;
+        if (match.productId == null && r.productId != null) patch.productId = r.productId;
+        if (Object.keys(patch).length > 0) {
+          await prisma.financeTransaction.update({ where: { id: match.id }, data: patch });
+          if (patch.quantity !== undefined) backfilledQty += 1;
+          if (patch.productId !== undefined) backfilledProductLink += 1;
         }
       }
     }
@@ -806,7 +838,7 @@ async function syncStoreAction(formData: FormData) {
   const parts = [
     productsResult.ok ? `товаров: ${productsResult.products.length} (новых: ${productsImported})` : `товары — ошибка: ${productsResult.message}`,
     syncResult.ok
-      ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}`
+      ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}${backfilledProductLink > 0 ? ` · привязка к товару восстановлена у ${backfilledProductLink} старых строк` : ''}`
       : `операции — ошибка: ${syncResult.message}`,
   ];
   const overallOk = productsResult.ok && syncResult.ok;
