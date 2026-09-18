@@ -328,6 +328,187 @@ export async function computeProductInsights(params: {
     .sort((a, b) => (a.flag ? 0 : 1) - (b.flag ? 0 : 1) || a.periodProfit - b.periodProfit);
 }
 
+// Более мелкая разбивка OZON_FEE-категорий для подробной постатейной таблицы на «Расходах»
+// (в отличие от FEE_BUCKET_BY_CATEGORY выше — той, что используется на «Товарах» и группирует
+// сборы всего в 4 группы). Сумма всех корзин здесь по-прежнему равна totalFees из
+// computeProductInsights — категория просто попадает в более узкую корзину, деньги никуда не
+// исчезают и не задваиваются. Категории, для которых пока не встретилось ни одного реального
+// примера в данных (эквайринг, хранение, утилизация, доп. обработка ОВХ, оплата за заказ, работа
+// с отзывами) — сюда намеренно не вписаны угадыванием: как только Ozon пришлёт такую категорию,
+// она ляжет в «Прочие сборы» ниже и будет видно, что появилось что-то новое, требующее разбора.
+const FINE_BUCKET_BY_CATEGORY: Record<string, string> = {
+  'Комиссия за продажу': 'commission',
+  'Комиссия за бренд': 'commission',
+  'Вознаграждение за продажу': 'commission',
+  Логистика: 'logistics',
+  'Курьерская доставка (последняя миля)': 'logistics',
+  'Кросс-докинг': 'shipmentProcessing',
+  'Приём отправления в пункте (Drop-off)': 'shipmentProcessing',
+  'Обработка отправления Drop-off партнёрами': 'shipmentProcessing',
+  'Обработка товара': 'shipmentProcessing',
+  Упаковка: 'shipmentProcessing',
+  'Стоимость упаковочных материалов': 'shipmentProcessing',
+  'Доставка до места передачи Ozon': 'deliveryToPickupPoint',
+  'Доставка до места выдачи': 'deliveryToPickupPoint',
+  'Приём возврата в пункте выдачи': 'returnsProcessing',
+  'Логистика возврата': 'reverseLogistics',
+  'Штраф за просрочку отгрузки': 'sellerFault',
+  'Отгрузка в нерекомендованный слот': 'sellerFault',
+  'Оплата за клик': 'clicks',
+  'Продвижение бренда': 'brandPromo',
+};
+
+/** Ключи корзин FINE_BUCKET_BY_CATEGORY + 'other' — единый список, чтобы нигде не разойтись. */
+const FINE_BUCKET_KEYS = [
+  'commission',
+  'acquiring',
+  'shipmentProcessing',
+  'logistics',
+  'deliveryToPickupPoint',
+  'storage',
+  'returnsProcessing',
+  'reverseLogistics',
+  'disposal',
+  'ovhProcessing',
+  'sellerFault',
+  'clicks',
+  'orderAds',
+  'brandPromo',
+  'reviews',
+  'other',
+] as const;
+export type FineFeeBucket = (typeof FINE_BUCKET_KEYS)[number];
+
+function bucketFineCategory(category: string): FineFeeBucket {
+  return (FINE_BUCKET_BY_CATEGORY[category] as FineFeeBucket) ?? 'other';
+}
+
+export interface ProductExpenseDetail extends ProductInsight {
+  /** Средняя цена продажи за период = выручка / кол-во шт. null, если продаж не было. */
+  avgSalePrice: number | null;
+  /** Штрихкод — из отчёта о реализации (см. ProductRealizationMonth), только за уже закрытые месяцы. */
+  barcode: string | null;
+  /** Доставлено/возвращено штук — из отчёта о реализации, ТОЛЬКО за уже закрытые календарные
+   *  месяцы, пересекающиеся с периодом. Если весь период приходится на ещё не закрытый месяц —
+   *  оба поля null (не 0 — это не «доставлено ноль», а «данных ещё нет»). */
+  deliveredQty: number | null;
+  returnedQty: number | null;
+  /** true, если период пересекается хотя бы с одним ещё НЕ закрытым месяцем — тогда
+   *  доставлено/возвращено (и баллы/партнёрские программы ниже) заведомо неполные. */
+  realizationPartial: boolean;
+  /** Баллы покупателя, партнёрские программы банков, «Звёздные товары» — из отчёта о реализации, те
+   *  же оговорки, что и у deliveredQty: null, если данных ещё нет (см. realizationPartial). */
+  bonusAmount: number | null;
+  bankCoinvestmentAmount: number | null;
+  starsAmount: number | null;
+  /** Мелкая разбивка сборов Ozon — см. FINE_BUCKET_BY_CATEGORY. Сумма всех значений равна
+   *  commissionFee + logisticsFee + handlingFee + otherFee (те же исходные строки, просто
+   *  разложены мельче). */
+  fine: Record<FineFeeBucket, number>;
+  /** Реклама = clicks + orderAds + brandPromo (оплата за клик + оплата за заказ + продвижение
+   *  бренда) — «работа с отзывами» сюда намеренно не входит, это не медиа-размещение, а
+   *  отдельная платная услуга. */
+  adSpend: number;
+  /** adSpend / revenue за период. null, если выручки не было. */
+  drrPercent: number | null;
+}
+
+export async function computeProductExpenseDetail(params: {
+  projectId: string;
+  storeId?: string;
+  from: Date;
+  to: Date;
+  dateBasis?: DateBasis;
+}): Promise<ProductExpenseDetail[]> {
+  const { projectId, storeId, from, to, dateBasis = 'order' } = params;
+  const base = await computeProductInsights(params);
+  const productIds = base.map((p) => p.id);
+  if (productIds.length === 0) return [];
+
+  const [feeTxs, realizationRows] = await Promise.all([
+    prisma.financeTransaction.findMany({
+      where: { projectId, productId: { in: productIds }, type: 'OZON_FEE', ...(storeId ? { storeId } : {}), ...dateWhere(dateBasis, from, to) },
+      select: { productId: true, category: true, amount: true },
+    }),
+    // Отчёт о реализации — помесячный, а не по произвольному периоду (см. ProductRealizationMonth) —
+    // берём все месяцы, ХОТЬ ЧАСТИЧНО пересекающиеся с [from, to] за этим магазином/проектом.
+    prisma.productRealizationMonth.findMany({
+      where: {
+        projectId,
+        productId: { in: productIds },
+        ...(storeId ? { storeId } : {}),
+        OR: monthsOverlapping(from, to).map(({ year, month }) => ({ year, month })),
+      },
+      select: { productId: true, year: true, month: true, deliveredQty: true, returnedQty: true, bonusAmount: true, starsAmount: true, bankCoinvestmentAmount: true },
+    }),
+  ]);
+
+  const fineByProduct = new Map<string, Record<FineFeeBucket, number>>();
+  const emptyFine = (): Record<FineFeeBucket, number> => Object.fromEntries(FINE_BUCKET_KEYS.map((k) => [k, 0])) as Record<FineFeeBucket, number>;
+  for (const t of feeTxs) {
+    if (!t.productId) continue;
+    const row = fineByProduct.get(t.productId) ?? emptyFine();
+    row[bucketFineCategory(t.category)] += t.amount;
+    fineByProduct.set(t.productId, row);
+  }
+
+  const realByProduct = new Map<string, { deliveredQty: number; returnedQty: number; bonusAmount: number; starsAmount: number; bankCoinvestmentAmount: number; monthsSeen: Set<string> }>();
+  for (const r of realizationRows) {
+    const row = realByProduct.get(r.productId) ?? { deliveredQty: 0, returnedQty: 0, bonusAmount: 0, starsAmount: 0, bankCoinvestmentAmount: 0, monthsSeen: new Set<string>() };
+    row.deliveredQty += r.deliveredQty;
+    row.returnedQty += r.returnedQty;
+    row.bonusAmount += r.bonusAmount;
+    row.starsAmount += r.starsAmount;
+    row.bankCoinvestmentAmount += r.bankCoinvestmentAmount;
+    row.monthsSeen.add(`${r.year}-${r.month}`);
+    realByProduct.set(r.productId, row);
+  }
+
+  const barcodeByProduct = new Map<string, string | null>();
+  {
+    const products = await prisma.product.findMany({ where: { id: { in: productIds } }, select: { id: true, barcode: true } });
+    for (const p of products) barcodeByProduct.set(p.id, p.barcode);
+  }
+
+  const allMonths = monthsOverlapping(from, to);
+  const monthsWithData = new Set(realizationRows.map((r) => `${r.year}-${r.month}`));
+  const realizationPartial = allMonths.some(({ year, month }) => !monthsWithData.has(`${year}-${month}`));
+
+  return base.map((p) => {
+    const fine = fineByProduct.get(p.id) ?? emptyFine();
+    const real = realByProduct.get(p.id);
+    const avgSalePrice = p.quantitySold > 0 ? p.revenue / p.quantitySold : null;
+    const adSpend = fine.clicks + fine.orderAds + fine.brandPromo;
+    const drrPercent = p.revenue > 0 ? adSpend / p.revenue : null;
+    return {
+      ...p,
+      avgSalePrice,
+      barcode: barcodeByProduct.get(p.id) ?? null,
+      deliveredQty: real ? real.deliveredQty : null,
+      returnedQty: real ? real.returnedQty : null,
+      realizationPartial,
+      bonusAmount: real ? real.bonusAmount : null,
+      bankCoinvestmentAmount: real ? real.bankCoinvestmentAmount : null,
+      starsAmount: real ? real.starsAmount : null,
+      fine,
+      adSpend,
+      drrPercent,
+    };
+  });
+}
+
+/** Все календарные месяцы (year, month), хотя бы частично пересекающиеся с [from, to]. */
+function monthsOverlapping(from: Date, to: Date): { year: number; month: number }[] {
+  const out: { year: number; month: number }[] = [];
+  const cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+  const end = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), 1));
+  for (let guard = 0; guard < 24 && cur <= end; guard++) {
+    out.push({ year: cur.getUTCFullYear(), month: cur.getUTCMonth() + 1 });
+    cur.setUTCMonth(cur.getUTCMonth() + 1);
+  }
+  return out;
+}
+
 export interface AttentionItem {
   title: string;
   detail: string;

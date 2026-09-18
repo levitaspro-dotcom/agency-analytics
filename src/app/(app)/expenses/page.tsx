@@ -1,6 +1,6 @@
 import { requireUser, listAccessibleProjects, assertProjectAccess } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
-import { computeFinanceSummary, computeProductInsights, type CategoryBreakdown } from '@/lib/finance';
+import { computeFinanceSummary, computeProductInsights, computeProductExpenseDetail, type CategoryBreakdown } from '@/lib/finance';
 import { translateCategory } from '@/lib/categoryLabels';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
@@ -19,6 +19,29 @@ const TYPE_LABEL: Record<string, string> = {
 
 function money(n: number) {
   return Math.round(n).toLocaleString('ru-RU') + ' ₽';
+}
+
+/** Рубли сверху, проценты снизу — в одной ячейке, как просила Ольга для ДРР и Прибыли. */
+function stackedCell(top: string, bottom: string, color?: string) {
+  return (
+    <div style={{ lineHeight: 1.35 }}>
+      <div style={{ fontVariantNumeric: 'tabular-nums', color }}>{top}</div>
+      <div style={{ fontSize: 11, color: color ?? 'var(--text-muted)' }}>{bottom}</div>
+    </div>
+  );
+}
+
+/** Убыток / требует внимания / хорошо — те же флаги, что уже посчитаны в computeProductInsights
+ *  (flag/reason), просто с подписями и цветом под эту таблицу. Единая логика с «Товарами» —
+ *  никакой отдельной, возможно расходящейся оценки «хорошо ли идут дела» здесь нет. */
+function statusMeta(flag: 'critical' | 'warning' | null): { label: string; cls: 'critical' | 'warning' | 'ok'; bg: string } {
+  if (flag === 'critical') return { label: 'Убыток', cls: 'critical', bg: 'var(--bad-bg)' };
+  if (flag === 'warning') return { label: 'Внимание', cls: 'warning', bg: 'var(--warn-bg)' };
+  return { label: 'Хорошо', cls: 'ok', bg: 'var(--good-bg)' };
+}
+
+function qtyCell(n: number | null) {
+  return n === null ? '—' : n.toLocaleString('ru-RU');
 }
 
 export default async function ExpensesPage({
@@ -74,6 +97,27 @@ export default async function ExpensesPage({
   const totalTax = soldProducts.reduce((s, p) => s + p.taxAmount, 0);
   const totalQuantitySold = soldProducts.reduce((s, p) => s + p.quantitySold, 0);
   const missingCostCount = soldProducts.filter((p) => p.costPrice <= 0).length;
+
+  // Подробная постатейная таблица по каждому товару — все расходы Ozon в разбивке по конкретным
+  // категориям (а не 4 укрупнённые группы, как на «Товарах»), плюс данные из «Позаказного отчёта о
+  // реализации» (штрихкод, доставлено/возвращено, баллы/партнёрские программы) — см. комментарии в
+  // lib/finance.ts (computeProductExpenseDetail) о том, почему часть столбцов может быть «—».
+  const detailAll = await computeProductExpenseDetail({ projectId, storeId, from, to, dateBasis: 'order' });
+  const detail = detailAll.filter((p) => p.quantitySold > 0 || p.revenue > 0 || p.totalExpenses > 0);
+  const detailTotals = detail.reduce(
+    (acc, p) => {
+      acc.cogsFromTx += p.cogsFromTx;
+      acc.quantitySold += p.quantitySold;
+      acc.revenue += p.revenue;
+      acc.adSpend += p.adSpend;
+      acc.periodProfit += p.periodProfit;
+      for (const k of Object.keys(p.fine) as (keyof typeof p.fine)[]) acc.fine[k] = (acc.fine[k] ?? 0) + p.fine[k];
+      return acc;
+    },
+    { cogsFromTx: 0, quantitySold: 0, revenue: 0, adSpend: 0, periodProfit: 0, fine: {} as Record<string, number> },
+  );
+  const detailTotalMargin = detailTotals.revenue > 0 ? detailTotals.periodProfit / detailTotals.revenue : null;
+  const detailTotalDrr = detailTotals.revenue > 0 ? detailTotals.adSpend / detailTotals.revenue : null;
 
   return (
     <div>
@@ -261,6 +305,174 @@ export default async function ExpensesPage({
               </tfoot>
             </table>
           </>
+        )}
+      </div>
+
+      <div className="panel">
+        <h2>Товары: подробно по каждому расходу</h2>
+        <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 10 }}>
+          Полная постатейная разбивка по каждому товару — все категории сборов Ozon по отдельности (а не
+          укрупнённо, как в «Расходах по группам» выше), плюс данные из «Позаказного отчёта о реализации»
+          (штрихкод, доставлено/возвращено штук, баллы покупателя, партнёрские программы банков). Сумма всех
+          столбцов группы «Комиссии и сборы Ozon» + «Реклама и продвижение» по товару равна его «Итого расходов»
+          на странице «Товары» (себестоимость и налог показаны там же, здесь не повторяем). 0 ₽ в любом из этих
+          столбцов означает «такого сбора по этому товару за период не было» — это реальный подсчёт, а не «не
+          подключено». Строки подсвечены по статусу: убыток — красным, требует внимания — жёлтым, хорошо —
+          зелёным (тот же критерий, что и столбец «Статус» на «Товарах»).
+        </p>
+        <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -4, marginBottom: 14 }}>
+          <b>Штрихкод, Доставлено, Возвращено, Баллы за скидку и Партнёрские программы</b> Ozon отдаёт только
+          отдельным отчётом за уже ЗАКРЫТЫЙ календарный месяц (публикует не раньше 5 числа следующего) — для
+          текущего/недавнего периода там будет «—», это не потерянные данные, а нормальное состояние: цифры
+          появятся сами после того, как месяц закроется и магазин пересинхронизируется (раздел «Магазины»).
+          Если период короче месяца — эти пять столбцов всё равно показывают данные за ВЕСЬ календарный месяц
+          (Ozon не отдаёт их мельче). <b>CTR</b> недоступен — нужна отдельная интеграция с рекламным API Ozon
+          (Performance API), сейчас не подключена.
+        </p>
+        {detail.length === 0 ? (
+          <div className="empty-state">За период нет ни продаж, ни расходов по товарам.</div>
+        ) : (
+          <div className="table-scroll sticky-head" style={{ overflowX: 'auto' }}>
+            <table className="data-table">
+              <thead>
+                <tr className="group-head-row">
+                  <th colSpan={3}>Товар</th>
+                  <th colSpan={6}>Продажи</th>
+                  <th colSpan={2} className="tooltip-hint" title="Баллы покупателя Ozon и программы софинансирования банков-партнёров — из «Позаказного отчёта о реализации», только за уже закрытые месяцы.">
+                    Бонусы Ozon (по отчёту реализации)
+                  </th>
+                  <th colSpan={12} className="tooltip-hint" title="Каждая категория сборов Ozon — отдельным столбцом. 0 ₽ — такого сбора по товару за период не было.">
+                    Комиссии и сборы Ozon
+                  </th>
+                  <th colSpan={7}>Реклама и продвижение</th>
+                  <th colSpan={2}>Итог</th>
+                </tr>
+                <tr>
+                  <th>Название</th>
+                  <th>SKU</th>
+                  <th className="tooltip-hint" title="Из «Позаказного отчёта о реализации» — только за уже закрытые месяцы.">ШК</th>
+                  <th className="tooltip-hint" title="Кол-во проданных штук × себестоимость единицы за период.">Себестоимость проданного</th>
+                  <th className="tooltip-hint" title="Выручка по товару за период / кол-во проданных штук.">Цена продажи</th>
+                  <th>Продано, шт</th>
+                  <th className="tooltip-hint" title="Из «Позаказного отчёта о реализации» — только за уже закрытые месяцы, за весь календарный месяц.">Доставлено, шт</th>
+                  <th className="tooltip-hint" title="Из «Позаказного отчёта о реализации» — только за уже закрытые месяцы, за весь календарный месяц.">Возвращено, шт</th>
+                  <th>Выручка</th>
+                  <th className="tooltip-hint" title="Сумма скидки, покрытая баллами покупателя Ozon. Только за уже закрытые месяцы.">Баллы за скидку</th>
+                  <th className="tooltip-hint" title="Софинансирование банков-партнёров по акциям. Только за уже закрытые месяцы.">Партнёрские программы</th>
+                  <th className="tooltip-hint" title="Комиссия за продажу + комиссия за бренд + вознаграждение за продажу.">Комиссия Ozon</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Эквайринг</th>
+                  <th className="tooltip-hint" title="Приём/обработка отправления, упаковка, кросс-докинг.">Обработка отправлений</th>
+                  <th className="tooltip-hint" title="Логистика + курьерская доставка (последняя миля).">Логистика</th>
+                  <th>Доставка до места выдачи</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Хранение</th>
+                  <th className="tooltip-hint" title="Приём возврата в пункте выдачи.">Обработка возвратов</th>
+                  <th>Обратная логистика</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Утилизация</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Доп. обработка ОВХ</th>
+                  <th className="tooltip-hint" title="Штраф за просрочку отгрузки, отгрузка в нерекомендованный слот.">Штрафы</th>
+                  <th className="tooltip-hint" title="Сборы Ozon, не попавшие ни в одну из категорий выше — сумма нигде не теряется.">Прочие сборы</th>
+                  <th>Оплата за клик</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Оплата за заказ</th>
+                  <th className="tooltip-hint" title="Из «Позаказного отчёта о реализации» — только за уже закрытые месяцы.">Звёздные товары</th>
+                  <th>Продвижение бренда</th>
+                  <th className="tooltip-hint" title="Пока не встречалась в данных этого магазина — появится автоматически, как только Ozon её пришлёт.">Работа с отзывами</th>
+                  <th className="tooltip-hint" title="Доля рекламных расходов от продаж = (Оплата за клик + Оплата за заказ + Звёздные товары + Продвижение бренда) / Выручка. Рубли сверху, % снизу.">ДРР</th>
+                  <th className="tooltip-hint" title="Нужна отдельная интеграция с рекламным API Ozon (Performance API) — сейчас не подключена.">CTR</th>
+                  <th className="tooltip-hint" title="Выручка минус себестоимость, все сборы Ozon и налог по товару (без учёта баллов/партнёрских программ выше — те данные ещё не проверены на реальных числах, отдельно от подтверждённого расчёта). Рубли сверху, % снизу.">Прибыль за период</th>
+                  <th>Статус</th>
+                </tr>
+              </thead>
+              <tbody>
+                {detail.map((p) => {
+                  const meta = statusMeta(p.flag);
+                  return (
+                    <tr key={p.id} style={{ background: meta.bg }}>
+                      <td>{p.name}</td>
+                      <td style={{ color: 'var(--text-muted)' }}>{p.sku}</td>
+                      <td style={{ color: 'var(--text-muted)' }}>{p.barcode ?? '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.cogsFromTx)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{p.avgSalePrice !== null ? money(p.avgSalePrice) : '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{p.quantitySold || '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{qtyCell(p.deliveredQty)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{qtyCell(p.returnedQty)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.revenue)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{p.bonusAmount !== null ? money(p.bonusAmount) : '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{p.bankCoinvestmentAmount !== null ? money(p.bankCoinvestmentAmount) : '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.commission)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.acquiring)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.shipmentProcessing)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.logistics)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.deliveryToPickupPoint)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.storage)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.returnsProcessing)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.reverseLogistics)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.disposal)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.ovhProcessing)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.sellerFault)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.other)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.clicks)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.orderAds)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{p.starsAmount !== null ? money(p.starsAmount) : '—'}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.brandPromo)}</td>
+                      <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(p.fine.reviews)}</td>
+                      <td>{stackedCell(money(p.adSpend), p.drrPercent !== null ? (p.drrPercent * 100).toFixed(1) + '%' : '—')}</td>
+                      <td style={{ color: 'var(--text-muted)' }}>—</td>
+                      <td>
+                        {stackedCell(
+                          money(p.periodProfit),
+                          p.periodMargin !== null ? (p.periodMargin * 100).toFixed(1) + '%' : '—',
+                          p.periodProfit < 0 ? 'var(--bad)' : undefined,
+                        )}
+                      </td>
+                      <td>
+                        <span className={`pill ${meta.cls}`} title={p.reason}>
+                          {meta.label}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr style={{ fontWeight: 600, borderTop: '2px solid var(--border)' }}>
+                  <td>Итого</td>
+                  <td></td>
+                  <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.cogsFromTx)}</td>
+                  <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{detailTotals.quantitySold}</td>
+                  <td></td>
+                  <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.revenue)}</td>
+                  <td></td>
+                  <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.commission ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.acquiring ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.shipmentProcessing ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.logistics ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.deliveryToPickupPoint ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.storage ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.returnsProcessing ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.reverseLogistics ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.disposal ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.ovhProcessing ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.sellerFault ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.other ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.clicks ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.orderAds ?? 0)}</td>
+                  <td></td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.brandPromo ?? 0)}</td>
+                  <td style={{ fontVariantNumeric: 'tabular-nums' }}>{money(detailTotals.fine.reviews ?? 0)}</td>
+                  <td>{stackedCell(money(detailTotals.adSpend), detailTotalDrr !== null ? (detailTotalDrr * 100).toFixed(1) + '%' : '—')}</td>
+                  <td></td>
+                  <td style={{ color: detailTotals.periodProfit < 0 ? 'var(--bad)' : 'inherit' }}>
+                    {stackedCell(money(detailTotals.periodProfit), detailTotalMargin !== null ? (detailTotalMargin * 100).toFixed(1) + '%' : '—')}
+                  </td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
         )}
       </div>
 

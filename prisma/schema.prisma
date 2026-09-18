@@ -142,6 +142,11 @@ model Product {
   sku          String
   /// Артикул продавца (offer_id) — стабильный ключ сопоставления с каталогом Ozon при повторных синхронизациях, в отличие от числового sku, который иногда недоступен сразу.
   offerId      String?
+  /// Штрихкод (ШК) — приходит из отчёта «Позаказный отчёт о реализации» (/v1/finance/realization/posting,
+  /// item.barcode), который Ozon публикует только за уже ЗАКРЫТЫЕ календарные месяцы (обычно не раньше
+  /// 5 числа следующего месяца). null, пока по этому товару не было ни одной синхронизации, попавшей на
+  /// уже закрытый месяц — это не ошибка, а нормальное состояние для текущего/недавнего периода.
+  barcode      String?
   sellPrice    Float
   costPrice    Float
   /// Товар есть в каталоге Ozon этого магазина по последней успешной синхронизации. При смене
@@ -152,8 +157,47 @@ model Product {
   active       Boolean               @default(true)
   createdAt    DateTime              @default(now())
   transactions FinanceTransaction[]
+  realizationMonths ProductRealizationMonth[]
 
   @@index([projectId, storeId, active])
+}
+
+/// Данные из «Позаказного отчёта о реализации» Ozon (/v1/finance/realization/posting) — один ряд на
+/// товар за КАЛЕНДАРНЫЙ месяц (Ozon отдаёт этот отчёт только помесячно, и только за уже закрытый
+/// месяц — обычно публикует не раньше 5 числа следующего). В отличие от FinanceTransaction (который
+/// собирается из /v1/finance/accrual/postings за произвольный период), эти данные физически не
+/// существуют у Ozon за текущий незакрытый месяц — поэтому за свежие периоды строк здесь не будет,
+/// это нормально, а не потерянные данные.
+///
+/// Хранится ОТДЕЛЬНО от FinanceTransaction (а не как ещё один OZON_FEE), чтобы не задваивать уже
+/// учтённую через accrual/postings комиссию/логистику — из этого отчёта в приложение попадают
+/// только показатели, которых больше НЕОТКУДА взять: доставлено/возвращено штук и суммы по баллам
+/// покупателя и партнёрским программам банков.
+model ProductRealizationMonth {
+  id        String   @id @default(cuid())
+  projectId String
+  storeId   String
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  year      Int
+  month     Int
+  /// Кол-во единиц товара, реально ДОСТАВЛЕННЫХ покупателю за этот календарный месяц (delivery_commission.quantity).
+  deliveredQty Int   @default(0)
+  /// Кол-во единиц товара, ВОЗВРАЩЁННЫХ за этот календарный месяц (return_commission.quantity).
+  returnedQty  Int   @default(0)
+  /// Сумма скидки, покрытой баллами покупателя Ozon (delivery_commission.bonus) — раньше эта категория
+  /// была в принципе недоступна ни через один метод API (см. историю lib/finance.ts), появилась только
+  /// с этим отчётом.
+  bonusAmount            Float @default(0)
+  /// Сумма по программам продвижения «Звёздные товары» (delivery_commission.stars).
+  starsAmount            Float @default(0)
+  /// Сумма по программам софинансирования банков-партнёров (delivery_commission.bank_coinvestment).
+  bankCoinvestmentAmount Float @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([productId, storeId, year, month])
+  @@index([projectId, year, month])
 }
 
 model FinanceTransaction {

@@ -6,7 +6,14 @@ import { requireUser, isManagerOrAbove, assertProjectAccess } from '@/lib/authz'
 import { prisma } from '@/lib/prisma';
 import { encryptSecret, decryptSecret, last4 } from '@/lib/crypto';
 import { issueInvite } from '@/lib/invite';
-import { testOzonConnection, fetchOzonFinanceTransactions, fetchOzonProducts, type OzonOperation, type OzonPostingProductLine } from '@/lib/integrations/ozon';
+import {
+  testOzonConnection,
+  fetchOzonFinanceTransactions,
+  fetchOzonProducts,
+  fetchRealizationReport,
+  type OzonOperation,
+  type OzonPostingProductLine,
+} from '@/lib/integrations/ozon';
 
 export const dynamic = 'force-dynamic';
 
@@ -867,11 +874,80 @@ async function syncStoreAction(formData: FormData) {
     }
   }
 
+  // «Позаказный отчёт о реализации» — штрихкод, доставлено/возвращено шт, баллы покупателя,
+  // партнёрские программы банков (см. комментарий у fetchRealizationReport/ProductRealizationMonth).
+  // Ozon отдаёт его только помесячно и только за уже ЗАКРЫТЫЙ календарный месяц — поэтому просто
+  // пробуем каждый календарный месяц, попадающий в период синхронизации, и молча пропускаем те,
+  // за которые Ozon ещё не готов отдать отчёт (это ожидаемо для текущего/недавнего месяца, а не
+  // ошибка синхронизации).
+  let realizationMonthsOk = 0;
+  let realizationMonthsSkipped = 0;
+  let realizationRowsMatched = 0;
+  let barcodesUpdated = 0;
+  if (productsResult.ok) {
+    const months: { year: number; month: number }[] = [];
+    {
+      const cur = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), 1));
+      const end = new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), 1));
+      for (let guard = 0; guard < 24 && cur <= end; guard++) {
+        months.push({ year: cur.getUTCFullYear(), month: cur.getUTCMonth() + 1 });
+        cur.setUTCMonth(cur.getUTCMonth() + 1);
+      }
+    }
+    for (const { year, month } of months) {
+      let result;
+      try {
+        result = await fetchRealizationReport(creds, year, month);
+      } catch (e) {
+        result = { ok: false, message: (e as Error).message, rows: [] };
+      }
+      if (!result.ok || result.rows.length === 0) {
+        realizationMonthsSkipped += 1;
+        continue;
+      }
+      realizationMonthsOk += 1;
+      for (const row of result.rows) {
+        const productId = (row.offerId && productIdByAliasSku.get(row.offerId)) || (row.sku && productIdByAliasSku.get(row.sku)) || null;
+        if (!productId) continue;
+        realizationRowsMatched += 1;
+        if (row.barcode) {
+          await prisma.product.update({ where: { id: productId }, data: { barcode: row.barcode } });
+          barcodesUpdated += 1;
+        }
+        await prisma.productRealizationMonth.upsert({
+          where: { productId_storeId_year_month: { productId, storeId: store.id, year, month } },
+          create: {
+            projectId: store.projectId,
+            storeId: store.id,
+            productId,
+            year,
+            month,
+            deliveredQty: row.deliveredQty,
+            returnedQty: row.returnedQty,
+            bonusAmount: row.bonusAmount,
+            starsAmount: row.starsAmount,
+            bankCoinvestmentAmount: row.bankCoinvestmentAmount,
+          },
+          update: {
+            deliveredQty: row.deliveredQty,
+            returnedQty: row.returnedQty,
+            bonusAmount: row.bonusAmount,
+            starsAmount: row.starsAmount,
+            bankCoinvestmentAmount: row.bankCoinvestmentAmount,
+          },
+        });
+      }
+    }
+  }
+
   const parts = [
     productsResult.ok ? `товаров: ${productsResult.products.length} (новых: ${productsImported})` : `товары — ошибка: ${productsResult.message}`,
     syncResult.ok
       ? `${syncResult.message} · новых операций сохранено: ${imported}${backfilledQty > 0 ? ` · кол-во дозаполнено у ${backfilledQty} старых строк выручки` : ''}${backfilledProductLink > 0 ? ` · привязка к товару восстановлена у ${backfilledProductLink} старых строк` : ''}${backfilledAccrualDate > 0 ? ` · дата начисления дозаполнена у ${backfilledAccrualDate} старых строк` : ''}`
       : `операции — ошибка: ${syncResult.message}`,
+    realizationMonthsOk > 0
+      ? `отчёт о реализации: ${realizationMonthsOk} закрытых месяцев учтено, товарных строк сопоставлено: ${realizationRowsMatched}${barcodesUpdated > 0 ? ` · штрихкод обновлён у ${barcodesUpdated}` : ''}${realizationMonthsSkipped > 0 ? ` · месяцев ещё не закрыто/недоступно: ${realizationMonthsSkipped}` : ''}`
+      : `отчёт о реализации: за выбранный период пока нет закрытых месяцев (Ozon публикует не раньше 5 числа следующего месяца) — штрихкод/доставлено/возвращено появятся после того, как месяц закроется и магазин пересинхронизируется`,
   ];
   const overallOk = productsResult.ok && syncResult.ok;
 
@@ -891,7 +967,7 @@ async function syncStoreAction(formData: FormData) {
       action: 'store.sync',
       targetType: 'Store',
       targetId: storeId,
-      meta: { ok: overallOk, imported, productsImported, days },
+      meta: { ok: overallOk, imported, productsImported, days, realizationMonthsOk, realizationRowsMatched, barcodesUpdated },
     },
   });
   revalidatePath('/projects');

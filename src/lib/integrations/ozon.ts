@@ -534,6 +534,80 @@ export async function fetchOzonFinanceTransactions(
   };
 }
 
+export interface OzonRealizationRow {
+  sku?: string;
+  offerId?: string;
+  barcode?: string;
+  deliveredQty: number;
+  returnedQty: number;
+  bonusAmount: number;
+  starsAmount: number;
+  bankCoinvestmentAmount: number;
+}
+
+export interface OzonRealizationResult {
+  /** true — отчёт получен и разобран (даже если пустой). false — либо месяц ещё не закрыт
+   *  (Ozon пока не готов отдать отчёт), либо реальная ошибка запроса — в обоих случаях это
+   *  НЕ должно останавливать остальную синхронизацию, см. message. */
+  ok: boolean;
+  message: string;
+  rows: OzonRealizationRow[];
+}
+
+/**
+ * «Позаказный отчёт о реализации» (/v1/finance/realization/posting) — единственный известный
+ * метод Ozon Seller API, отдающий помесячно штрихкод товара и РЕАЛЬНО доставленное/возвращённое
+ * количество, а также суммы по баллам покупателя и партнёрским программам банков — то, что через
+ * /v1/finance/accrual/postings (основной источник сборов в этом приложении) получить нельзя в
+ * принципе. Обратная сторона: Ozon формирует его только за уже завершённый календарный месяц,
+ * обычно публикует не раньше 5 числа следующего — запрос за текущий/слишком свежий месяц штатно
+ * возвращает пустой результат или ошибку, это НЕ признак поломки интеграции.
+ *
+ * Умышленно НЕ используем отсюда суммы комиссии/логистики (delivery_commission.commission и
+ * т.п.) — они уже надёжно посчитаны через accrual/postings и сверены с отчётами Ozon (см. историю
+ * lib/finance.ts); взяв их ещё раз отсюда, рисковали бы задвоить расходы, если два метода Ozon
+ * разойдутся на копейки. Берём только то, чего больше неоткуда взять.
+ */
+export async function fetchRealizationReport(creds: OzonCredentials, year: number, month: number): Promise<OzonRealizationResult> {
+  try {
+    const { ok, status, json } = await ozonFetch(creds, '/v1/finance/realization/posting', { year, month });
+    if (!ok) {
+      // 400/404 здесь чаще всего означает «месяц ещё не закрыт» — не поднимаем как ошибку
+      // синхронизации, просто сообщаем причину вызывающему коду.
+      return { ok: false, message: `Отчёт за ${month}.${year} недоступен (${ozonErrorMessage(status, json)}) — вероятно, месяц ещё не закрыт Ozon`, rows: [] };
+    }
+    const rawRows: any[] = Array.isArray(json?.rows) ? json.rows : Array.isArray(json?.result?.rows) ? json.result.rows : [];
+    if (rawRows.length === 0) {
+      return { ok: true, message: `Отчёт за ${month}.${year}: строк нет (нет реализации за месяц или месяц ещё не закрыт)`, rows: [] };
+    }
+
+    // Один товар может встретиться в нескольких строках (несколько отправлений за месяц) —
+    // складываем по sku/offer_id.
+    const bySkuOffer = new Map<string, OzonRealizationRow>();
+    for (const r of rawRows) {
+      const item = r?.item ?? {};
+      const sku = item?.sku !== undefined && item?.sku !== null && item.sku !== 0 ? String(item.sku) : undefined;
+      const offerId = item?.offer_id !== undefined && item?.offer_id !== null ? String(item.offer_id) : undefined;
+      const barcode = item?.barcode ? String(item.barcode) : undefined;
+      const key = sku ?? offerId ?? 'unknown';
+      const cur = bySkuOffer.get(key) ?? { sku, offerId, barcode, deliveredQty: 0, returnedQty: 0, bonusAmount: 0, starsAmount: 0, bankCoinvestmentAmount: 0 };
+      const dc = r?.delivery_commission ?? {};
+      const rc = r?.return_commission ?? {};
+      cur.deliveredQty += Number(dc?.quantity) || 0;
+      cur.returnedQty += Number(rc?.quantity) || 0;
+      cur.bonusAmount += Math.abs(Number(dc?.bonus) || 0);
+      cur.starsAmount += Math.abs(Number(dc?.stars) || 0);
+      cur.bankCoinvestmentAmount += Math.abs(Number(dc?.bank_coinvestment) || 0);
+      if (!cur.barcode && barcode) cur.barcode = barcode;
+      bySkuOffer.set(key, cur);
+    }
+
+    return { ok: true, message: `Отчёт за ${month}.${year}: товарных позиций — ${bySkuOffer.size}`, rows: Array.from(bySkuOffer.values()) };
+  } catch (e) {
+    return { ok: false, message: `Не удалось получить отчёт за ${month}.${year}: ${(e as Error).message}`, rows: [] };
+  }
+}
+
 export interface OzonProduct {
   /** Числовой SKU Ozon для отображения. */
   sku: string;
