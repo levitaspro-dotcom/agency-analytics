@@ -147,6 +147,9 @@ export interface ProductInsight {
   /** Себестоимость проданного за период = quantitySold × текущая Product.costPrice (считается
    *  здесь же, а не берётся из сохранённых COGS-строк — см. комментарий в computeProductInsights). */
   cogsFromTx: number;
+  /** Себестоимость ЕДИНИЦЫ товара (Product.costPrice как есть, без умножения на количество) —
+   *  0, если ещё не введена. Для отображения формулы «кол-во × себестоимость» рядом со суммой. */
+  costPrice: number;
   /** Комиссия Ozon за продажу и за бренд. */
   commissionFee: number;
   /** Логистика, последняя миля, логистика возврата, доставка/приём в пункте. */
@@ -271,6 +274,7 @@ export async function computeProductInsights(params: {
         quantitySold,
         revenue,
         cogsFromTx,
+        costPrice: p.costPrice,
         commissionFee: fees.commission,
         logisticsFee: fees.logistics,
         handlingFee: fees.handling,

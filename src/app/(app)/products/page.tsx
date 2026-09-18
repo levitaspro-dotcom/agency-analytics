@@ -108,6 +108,37 @@ export default async function ProductsPage({
   }
   const filtersActive = q !== '' || status !== '' || sort !== '';
 
+  // Итоговая строка под таблицей — суммы по товарам, которые сейчас видны в таблице (с учётом
+  // фильтров). «Себестоимость проданного, итого» — это и есть общая сумма по себестоимости
+  // проданных товаров за период (кол-во проданных штук каждого товара × его себестоимость,
+  // просуммированное по всем товарам).
+  const totals = products.reduce(
+    (acc, p) => {
+      acc.quantitySold += p.quantitySold;
+      acc.revenue += p.revenue;
+      acc.cogsFromTx += p.cogsFromTx;
+      acc.commissionFee += p.commissionFee;
+      acc.logisticsFee += p.logisticsFee;
+      acc.handlingFee += p.handlingFee;
+      acc.otherFee += p.otherFee;
+      acc.totalExpenses += p.totalExpenses;
+      acc.periodProfit += p.periodProfit;
+      return acc;
+    },
+    {
+      quantitySold: 0,
+      revenue: 0,
+      cogsFromTx: 0,
+      commissionFee: 0,
+      logisticsFee: 0,
+      handlingFee: 0,
+      otherFee: 0,
+      totalExpenses: 0,
+      periodProfit: 0,
+    },
+  );
+  const totalMargin = totals.revenue > 0 ? totals.periodProfit / totals.revenue : null;
+
   return (
     <div>
       <FilterBar basePath="/products" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} dateBasis={dateBasis} />
@@ -216,6 +247,12 @@ export default async function ProductsPage({
                     <th>Кол-во, шт</th>
                     <th>Цена продажи</th>
                     <th>Себестоимость</th>
+                    <th
+                      className="tooltip-hint"
+                      title="Кол-во, шт × Себестоимость за период — общая сумма себестоимости проданных штук этого товара (например, 13 продаж × 699 ₽ = 9 087 ₽)"
+                    >
+                      Себестоимость проданного
+                    </th>
                     <th>Выручка</th>
                     <th>Комиссия Ozon</th>
                     <th>Логистика</th>
@@ -283,6 +320,11 @@ export default async function ProductsPage({
                             '—'
                           )}
                         </td>
+                        <td style={{ fontVariantNumeric: 'tabular-nums' }}>
+                          {p.quantitySold > 0 && priced && priced.costPrice > 0
+                            ? `${p.quantitySold} × ${Math.round(priced.costPrice).toLocaleString('ru-RU')} ₽ = ${Math.round(p.cogsFromTx).toLocaleString('ru-RU')} ₽`
+                            : '—'}
+                        </td>
                         <td>{Math.round(p.revenue).toLocaleString('ru-RU')} ₽</td>
                         <td>{Math.round(p.commissionFee).toLocaleString('ru-RU')} ₽</td>
                         <td>{Math.round(p.logisticsFee).toLocaleString('ru-RU')} ₽</td>
@@ -310,6 +352,32 @@ export default async function ProductsPage({
                     );
                   })}
                 </tbody>
+                <tfoot>
+                  <tr style={{ fontWeight: 600, borderTop: '2px solid var(--border)' }}>
+                    <td>Итого{filtersActive ? ` (по ${products.length} товарам с учётом фильтра)` : ''}</td>
+                    <td></td>
+                    <td></td>
+                    <td style={{ fontVariantNumeric: 'tabular-nums' }}>{totals.quantitySold || '—'}</td>
+                    <td></td>
+                    <td></td>
+                    <td style={{ fontVariantNumeric: 'tabular-nums' }}>{Math.round(totals.cogsFromTx).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.revenue).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.commissionFee).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.logisticsFee).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.handlingFee).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.otherFee).toLocaleString('ru-RU')} ₽</td>
+                    <td>{Math.round(totals.totalExpenses).toLocaleString('ru-RU')} ₽</td>
+                    <td style={{ color: totals.periodProfit < 0 ? 'var(--bad)' : 'inherit' }}>
+                      {Math.round(totals.periodProfit).toLocaleString('ru-RU')} ₽
+                    </td>
+                    <td style={{ color: totalMargin !== null && totalMargin < 0 ? 'var(--bad)' : 'inherit' }}>
+                      {totalMargin === null ? '—' : (totalMargin * 100).toFixed(1) + '%'}
+                    </td>
+                    <td></td>
+                    <td></td>
+                    <td></td>
+                  </tr>
+                </tfoot>
               </table>
             </div>
             )}
