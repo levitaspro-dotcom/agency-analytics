@@ -8,6 +8,8 @@
  * Документация: https://docs.ozon.ru/api/seller/
  */
 
+import { translateCategory } from '../categoryLabels';
+
 const OZON_API_BASE = 'https://api-seller.ozon.ru';
 
 export interface OzonCredentials {
@@ -281,7 +283,9 @@ async function fetchAccrualTypeNames(creds: OzonCredentials): Promise<{ map: Map
         // "Оплата за клик"). Раньше здесь сначала брали "name" — на карточках товаров и в
         // «Расходах» вместо русских названий показывались английские коды.
         const name = t?.description ?? t?.name_ru ?? t?.title_ru ?? t?.name ?? t?.title ?? t?.type_name;
-        if (id !== undefined && id !== null && name) map.set(Number(id), String(name));
+        // Если и "description" пуст, и остались только английские варианты — пробуем словарь
+        // известных кодов (см. lib/categoryLabels.ts), прежде чем сдаться и сохранить английский.
+        if (id !== undefined && id !== null && name) map.set(Number(id), translateCategory(String(name)));
       }
       if (map.size > 0) return { map, diagnostic: null };
     }

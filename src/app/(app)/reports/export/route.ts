@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireUser, assertProjectAccess, ForbiddenError } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
 import { prisma } from '@/lib/prisma';
+import { translateCategory } from '@/lib/categoryLabels';
 
 export const dynamic = 'force-dynamic';
 
@@ -52,7 +53,7 @@ export async function GET(req: NextRequest) {
       [
         formatDate(r.date),
         TYPE_LABEL[r.type] ?? r.type,
-        r.category,
+        translateCategory(r.category),
         String(Math.round(r.amount)),
         r.store?.name ?? '',
         r.product?.name ?? '',

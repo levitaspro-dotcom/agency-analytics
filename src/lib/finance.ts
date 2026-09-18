@@ -1,6 +1,7 @@
 import { prisma } from './prisma';
 import type { TransactionType } from '@prisma/client';
 import { previousPeriod } from './period';
+import { translateCategory } from './categoryLabels';
 
 export type CategoryBreakdown = { category: string; amount: number }[];
 
@@ -45,7 +46,14 @@ export function dateWhere(basis: DateBasis, from: Date, to: Date) {
 
 function sumByCategory(rows: { category: string; amount: number }[]): CategoryBreakdown {
   const map = new Map<string, number>();
-  for (const r of rows) map.set(r.category, (map.get(r.category) ?? 0) + r.amount);
+  // translateCategory — на случай, если в базе ещё остались старые операции с английским кодом
+  // категории (сохранённые до того, как ozon.ts начал переводить их при синхронизации сам) —
+  // так они «сливаются» в одну строку с уже переведёнными новыми операциями той же категории,
+  // а не показываются отдельной строкой на английском.
+  for (const r of rows) {
+    const category = translateCategory(r.category);
+    map.set(category, (map.get(category) ?? 0) + r.amount);
+  }
   return Array.from(map.entries())
     .map(([category, amount]) => ({ category, amount }))
     .sort((a, b) => b.amount - a.amount);
@@ -118,17 +126,31 @@ export async function computeFinanceSummary(params: {
  * API с другими ключами; хранение и эквайринг в текущих данных ни разу не встречались —
  * либо их нет у этих магазинов, либо нужен другой отчёт Ozon), сюда не включены.
  */
+// Ключи — и исходные английские коды (старые операции, сохранённые до того, как ozon.ts начал
+// переводить их сам при синхронизации), и их русский перевод из lib/categoryLabels.ts (новые
+// операции сохраняются уже переведёнными) — иначе после перевода эти сборы молча уехали бы в
+// «Прочие сборы Ozon» на странице «Товары», хотя раньше корректно попадали в свою группу.
 const FEE_BUCKET_BY_CATEGORY: Record<string, 'commission' | 'logistics' | 'handling'> = {
   SaleCommission: 'commission',
+  'Комиссия за продажу': 'commission',
   BrandCommission: 'commission',
+  'Комиссия за бренд': 'commission',
   Logistic: 'logistics',
+  Логистика: 'logistics',
   LastMileCourier: 'logistics',
+  'Курьерская доставка (последняя миля)': 'logistics',
   ReturnFlowLogistic: 'logistics',
+  'Логистика возврата': 'logistics',
   'Drop-Off Agent': 'logistics',
+  'Приём отправления в пункте (Drop-off)': 'logistics',
   DeliveryToHandoverPlaceByOzon: 'logistics',
+  'Доставка до места передачи Ozon': 'logistics',
   PackingFee: 'handling',
+  Упаковка: 'handling',
   PackageCost: 'handling',
+  'Стоимость упаковочных материалов': 'handling',
   PickUpPointReturnAcceptance: 'handling',
+  'Приём возврата в пункте выдачи': 'handling',
 };
 
 function bucketFeeCategory(category: string): 'commission' | 'logistics' | 'handling' | 'other' {

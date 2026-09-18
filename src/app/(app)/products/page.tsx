@@ -1,6 +1,7 @@
 import { requireUser, listAccessibleProjects, assertProjectAccess, isManagerOrAbove } from '@/lib/authz';
 import { resolvePeriod } from '@/lib/period';
 import { computeProductInsights, dateWhere, type DateBasis } from '@/lib/finance';
+import { translateCategory } from '@/lib/categoryLabels';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
 import { updateProductCostAction } from '../projects/page';
@@ -390,7 +391,7 @@ export default async function ProductsPage({
                     {unmatchedTx.map((t) => (
                       <tr key={t.id}>
                         <td>{t.type === 'REVENUE' ? 'Выручка' : 'Комиссия/сбор'}</td>
-                        <td>{t.category}</td>
+                        <td>{translateCategory(t.category)}</td>
                         <td>{Math.round(t.amount).toLocaleString('ru-RU')} ₽</td>
                         <td>{t.quantity ?? '—'}</td>
                         <td>{t.date.toISOString().slice(0, 10)}</td>

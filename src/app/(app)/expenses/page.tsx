@@ -1,17 +1,25 @@
 import { requireUser, listAccessibleProjects, assertProjectAccess } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
-import { computeProductInsights } from '@/lib/finance';
+import { computeFinanceSummary, computeProductInsights, type CategoryBreakdown } from '@/lib/finance';
+import { translateCategory } from '@/lib/categoryLabels';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
 
 export const dynamic = 'force-dynamic';
 
+// Группы — те же 4 типа операций, что и везде в приложении (FinanceTransaction.type), но с
+// названиями для этой страницы: «Расходы по группам» ниже показывает их итогом, «Подробно по
+// категориям» — детально внутри каждой группы.
 const TYPE_LABEL: Record<string, string> = {
-  OZON_FEE: 'Расходы Ozon',
-  COGS: 'Себестоимость',
+  OZON_FEE: 'Комиссии и сборы Ozon',
+  COGS: 'Себестоимость товаров',
   EXTERNAL_EXPENSE: 'Внешние расходы',
-  TAX: 'Налоги',
+  TAX: 'Налог',
 };
+
+function money(n: number) {
+  return Math.round(n).toLocaleString('ru-RU') + ' ₽';
+}
 
 export default async function ExpensesPage({
   searchParams,
@@ -27,6 +35,22 @@ export default async function ExpensesPage({
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
 
+  // computeFinanceSummary — тот же расчёт, что и на «Обзоре»/«Отчётах»: суммы по категориям здесь
+  // уже переведены на русский (см. translateCategory в lib/finance.ts) и, важно, здесь ЕСТЬ налог —
+  // включая расчётный (ставка проекта × выручка), которого нет как отдельной сохранённой операции
+  // (раньше эта страница считала категории сама, напрямую по FinanceTransaction, и расчётный налог
+  // из-за этого никогда сюда не попадал).
+  const summary = await computeFinanceSummary({ projectId, storeId, from, to });
+
+  const groups: { key: keyof typeof TYPE_LABEL; label: string; amount: number; rows: CategoryBreakdown }[] = [
+    { key: 'OZON_FEE', label: TYPE_LABEL.OZON_FEE, amount: summary.ozonFees, rows: summary.byType.OZON_FEE },
+    { key: 'COGS', label: TYPE_LABEL.COGS, amount: summary.cogs, rows: summary.byType.COGS },
+    { key: 'EXTERNAL_EXPENSE', label: TYPE_LABEL.EXTERNAL_EXPENSE, amount: summary.externalExpenses, rows: summary.byType.EXTERNAL_EXPENSE },
+    { key: 'TAX', label: TYPE_LABEL.TAX, amount: summary.taxes, rows: summary.byType.TAX },
+  ];
+  const hasAnyExpenses = groups.some((g) => g.amount > 0);
+  const hasComputedTax = summary.byType.TAX.some((r) => r.category.startsWith('Налог по ставке'));
+
   const rows = await prisma.financeTransaction.findMany({
     where: {
       projectId,
@@ -37,12 +61,6 @@ export default async function ExpensesPage({
     orderBy: { date: 'desc' },
     include: { product: true },
   });
-
-  const totalsByCategory = new Map<string, number>();
-  for (const r of rows) {
-    const key = `${TYPE_LABEL[r.type]} · ${r.category}`;
-    totalsByCategory.set(key, (totalsByCategory.get(key) ?? 0) + r.amount);
-  }
 
   // Себестоимость проданных товаров за период, по каждому товару — считается «живьём» от кол-ва
   // проданных штук × текущей себестоимости (та же логика, что и на странице «Товары»), а не
@@ -62,28 +80,115 @@ export default async function ExpensesPage({
       <FilterBar basePath="/expenses" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
 
       <div className="panel">
-        <h2>Расходы по категориям</h2>
-        {totalsByCategory.size === 0 ? (
+        <h2>Все расходы за период</h2>
+        <div className="kpi-grid">
+          <div className="kpi-card">
+            <div className="kpi-label">Выручка</div>
+            <div className="kpi-value">{money(summary.revenue)}</div>
+          </div>
+          <div className="kpi-card">
+            <div className="kpi-label">
+              <span
+                className="tooltip-hint"
+                title="Сумма всех расходов за период по всем группам ниже: комиссии и сборы Ozon + себестоимость проданных товаров + внешние расходы + налог."
+              >
+                Все расходы
+              </span>
+            </div>
+            <div className="kpi-value">{money(summary.totalExpenses)}</div>
+            <div className="kpi-sub">по всем товарам магазина — разбивка по группам ниже</div>
+          </div>
+          <div className={`kpi-card ${summary.profit >= 0 ? 'positive' : 'negative'}`}>
+            <div className="kpi-label">
+              <span className="tooltip-hint" title="Выручка за период минус «Все расходы» (Ozon + себестоимость + внешние расходы + налог).">
+                Прибыль после налога
+              </span>
+            </div>
+            <div className="kpi-value">{money(summary.profit)}</div>
+          </div>
+          <div className="kpi-card">
+            <div className="kpi-label">
+              <span className="tooltip-hint" title="Прибыль после налога за период, делённая на выручку за период (в процентах).">
+                Маржинальность
+              </span>
+            </div>
+            <div className="kpi-value">{(summary.margin * 100).toFixed(1)}%</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="panel">
+        <h2>Расходы по группам</h2>
+        {!hasAnyExpenses ? (
           <div className="empty-state">За период расходов нет.</div>
         ) : (
           <table className="data-table">
             <thead>
               <tr>
-                <th>Категория</th>
+                <th>Группа</th>
                 <th>Сумма</th>
+                <th>Доля от всех расходов</th>
               </tr>
             </thead>
             <tbody>
-              {Array.from(totalsByCategory.entries())
-                .sort((a, b) => b[1] - a[1])
-                .map(([cat, amt]) => (
-                  <tr key={cat}>
-                    <td>{cat}</td>
-                    <td>{Math.round(amt).toLocaleString('ru-RU')} ₽</td>
-                  </tr>
-                ))}
+              {groups.map((g) => (
+                <tr key={g.key}>
+                  <td>{g.label}</td>
+                  <td>{money(g.amount)}</td>
+                  <td>{summary.totalExpenses > 0 ? ((g.amount / summary.totalExpenses) * 100).toFixed(1) + '%' : '—'}</td>
+                </tr>
+              ))}
             </tbody>
+            <tfoot>
+              <tr style={{ fontWeight: 600, borderTop: '2px solid var(--border)' }}>
+                <td>Итого — все расходы</td>
+                <td>{money(summary.totalExpenses)}</td>
+                <td>{summary.totalExpenses > 0 ? '100%' : '—'}</td>
+              </tr>
+            </tfoot>
           </table>
+        )}
+      </div>
+
+      <div className="panel">
+        <h2>Подробно по категориям</h2>
+        {!hasAnyExpenses ? (
+          <div className="empty-state">За период расходов нет.</div>
+        ) : (
+          <>
+            {groups.map(
+              (g) =>
+                g.rows.length > 0 && (
+                  <div key={g.key} style={{ marginBottom: 20 }}>
+                    <h3 style={{ fontSize: 14, marginBottom: 8 }}>
+                      {g.label} — {money(g.amount)}
+                    </h3>
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th>Категория</th>
+                          <th>Сумма</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {g.rows.map((r) => (
+                          <tr key={r.category}>
+                            <td>{r.category}</td>
+                            <td>{money(r.amount)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                ),
+            )}
+            {hasComputedTax && (
+              <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8 }}>
+                «Налог по ставке X% от выручки» — расчётная величина (ставка налога проекта × выручка за период), а не
+                отдельная сохранённая операция, поэтому такой строки не будет в «Исходных операциях» ниже.
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -180,7 +285,7 @@ export default async function ExpensesPage({
                 <tr key={r.id}>
                   <td>{formatDate(r.date)}</td>
                   <td>{TYPE_LABEL[r.type]}</td>
-                  <td>{r.category}</td>
+                  <td>{translateCategory(r.category)}</td>
                   <td>{r.product?.name ?? '—'}</td>
                   <td>{Math.round(r.amount).toLocaleString('ru-RU')} ₽</td>
                   <td style={{ color: 'var(--text-muted)' }}>{r.description ?? ''}</td>
