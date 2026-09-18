@@ -78,11 +78,25 @@ export default async function AgencyOverviewPage({
               <div className="kpi-sub">{rows.length} магазинов за период</div>
             </div>
             <div className="kpi-card">
-              <div className="kpi-label">Все расходы</div>
+              <div className="kpi-label">
+                <span
+                  className="tooltip-hint"
+                  title="Сумма всех расходов по всем магазинам агентства за период: комиссии и сборы Ozon + себестоимость проданных товаров + внешние расходы + налог по каждому магазину."
+                >
+                  Все расходы
+                </span>
+              </div>
               <div className="kpi-value">{money(totals.totalExpenses)}</div>
             </div>
             <div className={`kpi-card ${totals.profit >= 0 ? 'positive' : 'negative'}`}>
-              <div className="kpi-label">Суммарная прибыль</div>
+              <div className="kpi-label">
+                <span
+                  className="tooltip-hint"
+                  title="Суммарная выручка по всем магазинам минус «Все расходы» по всем магазинам за период. «Маржа» в подписи ниже — это суммарная прибыль, делённая на суммарную выручку."
+                >
+                  Суммарная прибыль
+                </span>
+              </div>
               <div className="kpi-value">{money(totals.profit)}</div>
               <div className="kpi-sub">маржа {(totalMargin * 100).toFixed(1)}%</div>
             </div>

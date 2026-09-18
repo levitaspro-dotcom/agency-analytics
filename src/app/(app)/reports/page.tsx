@@ -98,16 +98,37 @@ export default async function ReportsPage({
             <div className="kpi-value">{money(summary.revenue)}</div>
           </div>
           <div className="kpi-card">
-            <div className="kpi-label">Все расходы</div>
+            <div className="kpi-label">
+              <span
+                className="tooltip-hint"
+                title="Сумма всех расходов магазина за период по всем категориям: комиссии и сборы Ozon (комиссия, логистика, реклама, эквайринг и т.п.) + себестоимость проданных товаров + внешние расходы (если вносили вручную) + налог (по ставке проекта от выручки, если задана, плюс ручные налоговые операции)."
+              >
+                Все расходы
+              </span>
+            </div>
             <div className="kpi-value">{money(summary.totalExpenses)}</div>
             <div className="kpi-sub">комиссии Ozon + себестоимость + внешние + налоги</div>
           </div>
           <div className={`kpi-card ${summary.profit >= 0 ? 'positive' : 'negative'}`}>
-            <div className="kpi-label">Прибыль после налога</div>
+            <div className="kpi-label">
+              <span
+                className="tooltip-hint"
+                title="Выручка за период минус «Все расходы» (Ozon + себестоимость + внешние расходы + налог). Это итоговая прибыль магазина за период, уже после вычета налога."
+              >
+                Прибыль после налога
+              </span>
+            </div>
             <div className="kpi-value">{money(summary.profit)}</div>
           </div>
           <div className="kpi-card">
-            <div className="kpi-label">Маржинальность</div>
+            <div className="kpi-label">
+              <span
+                className="tooltip-hint"
+                title="Прибыль после налога за период, делённая на выручку за период (в процентах) — показывает, сколько из каждого рубля выручки остаётся прибылью после всех расходов."
+              >
+                Маржинальность
+              </span>
+            </div>
             <div className="kpi-value">{(summary.margin * 100).toFixed(1)}%</div>
           </div>
         </div>
@@ -130,7 +151,12 @@ export default async function ReportsPage({
               <tr>
                 <th>Товар</th>
                 <th>SKU</th>
-                <th>Прибыль за период</th>
+                <th
+                  className="tooltip-hint"
+                  title="Выручка по товару за период минус себестоимость проданного и все сборы Ozon по этому товару. Налог здесь не вычитается — он считается по всему магазину, не по отдельному товару, см. «Прибыль после налога» выше."
+                >
+                  Прибыль за период
+                </th>
                 <th>Причина</th>
               </tr>
             </thead>
