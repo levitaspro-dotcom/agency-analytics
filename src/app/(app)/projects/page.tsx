@@ -14,6 +14,7 @@ import {
   type OzonOperation,
   type OzonPostingProductLine,
 } from '@/lib/integrations/ozon';
+import { testOzonPerformanceConnection } from '@/lib/integrations/ozonPerformance';
 
 export const dynamic = 'force-dynamic';
 
@@ -459,6 +460,74 @@ async function testStoreConnectionAction(formData: FormData) {
   });
   await prisma.activityLog.create({
     data: { actorId: user.id, actorName: user.name, action: 'store.testConnection', targetType: 'Store', targetId: storeId, meta: result },
+  });
+  revalidatePath('/projects');
+}
+
+// Client-Secret необязателен — если оставить поле пустым, прежний секрет сохраняется (как и у
+// Api-Key основного подключения выше). Это ОТДЕЛЬНАЯ пара ключей рекламного кабинета Ozon
+// (Performance API) — см. комментарий в prisma/schema.prisma у Store.ozonPerfClientId.
+async function updateShopAdCredsAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const storeId = String(formData.get('storeId') || '');
+  const ozonPerfClientId = String(formData.get('ozonPerfClientId') || '').trim();
+  const ozonPerfClientSecret = String(formData.get('ozonPerfClientSecret') || '').trim();
+  if (!storeId) return;
+  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
+  await assertProjectAccess(user, store.projectId);
+
+  const secretData = ozonPerfClientSecret
+    ? { ozonPerfClientSecretEncrypted: encryptSecret(ozonPerfClientSecret), ozonPerfClientSecretLast4: last4(ozonPerfClientSecret) }
+    : {};
+
+  await prisma.store.update({
+    where: { id: storeId },
+    data: {
+      ozonPerfClientId: ozonPerfClientId || null,
+      ...secretData,
+      // Прежний результат проверки относился к старым ключам — после изменения он уже не показателен.
+      lastPerfTestAt: null,
+      lastPerfTestOk: null,
+      lastPerfTestMessage: null,
+    },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'store.updateAdCreds', targetType: 'Store', targetId: storeId, meta: { ozonPerfClientId } },
+  });
+  revalidatePath('/projects');
+}
+
+async function testStoreAdConnectionAction(formData: FormData) {
+  'use server';
+  const user = await requireUser();
+  if (!isManagerOrAbove(user.role)) throw new Error('Недостаточно прав');
+  const storeId = String(formData.get('storeId') || '');
+  if (!storeId) return;
+  const store = await prisma.store.findUniqueOrThrow({ where: { id: storeId } });
+  await assertProjectAccess(user, store.projectId);
+
+  let result: { ok: boolean; message: string };
+  if (!store.ozonPerfClientId || !store.ozonPerfClientSecretEncrypted) {
+    result = { ok: false, message: 'Сначала укажите Client-Id и Client-Secret рекламного кабинета.' };
+  } else {
+    try {
+      result = await testOzonPerformanceConnection({
+        clientId: store.ozonPerfClientId,
+        clientSecret: decryptSecret(store.ozonPerfClientSecretEncrypted),
+      });
+    } catch (e) {
+      result = { ok: false, message: (e as Error).message };
+    }
+  }
+
+  await prisma.store.update({
+    where: { id: storeId },
+    data: { lastPerfTestAt: new Date(), lastPerfTestOk: result.ok, lastPerfTestMessage: result.message },
+  });
+  await prisma.activityLog.create({
+    data: { actorId: user.id, actorName: user.name, action: 'store.testAdConnection', targetType: 'Store', targetId: storeId, meta: result },
   });
   revalidatePath('/projects');
 }
@@ -1322,6 +1391,7 @@ export default async function ProjectsPage({
                 <h3>
                   {client.name} · {p.name} · {MARKETPLACE_LABEL[p.marketplace] ?? p.marketplace}
                 </h3>
+                <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginBottom: 2 }}>Seller API (товары, заказы, финансы):</div>
                 <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
                   <form action={updateShopCredsAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
                     <input type="hidden" name="projectId" value={p.id} />
@@ -1383,6 +1453,51 @@ export default async function ProjectsPage({
                     </>
                   )}
                 </div>
+
+                {store && (
+                  <>
+                    <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 10, marginBottom: 2 }}>Performance API (реклама — отдельный ключ, берётся в Ozon: Продвижение → Настройки Performance API):</div>
+                    <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+                    <form action={updateShopAdCredsAction} style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+                      <input type="hidden" name="storeId" value={store.id} />
+                      <input
+                        type="text"
+                        name="ozonPerfClientId"
+                        placeholder="Client-Id рекламного кабинета"
+                        defaultValue={store.ozonPerfClientId ?? ''}
+                        style={{ width: 170, padding: '4px 6px', fontSize: 12.5 }}
+                      />
+                      <input
+                        type="password"
+                        name="ozonPerfClientSecret"
+                        placeholder={store.ozonPerfClientSecretLast4 ? `оставить ••••${store.ozonPerfClientSecretLast4}` : 'Client-Secret рекламного кабинета'}
+                        autoComplete="off"
+                        style={{ width: 220, padding: '4px 6px', fontSize: 12.5 }}
+                      />
+                      <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                        Сохранить
+                      </button>
+                    </form>
+
+                    <div style={{ fontSize: 12.5 }}>
+                      {store.lastPerfTestAt ? (
+                        <span className={`pill ${store.lastPerfTestOk ? 'ok' : 'critical'}`}>{store.lastPerfTestOk ? 'Подключено' : 'Ошибка'}</span>
+                      ) : (
+                        <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>ещё не проверялось</span>
+                      )}
+                      {store.lastPerfTestMessage && (
+                        <div style={{ fontSize: 11.5, color: 'var(--text-muted)', marginTop: 2, maxWidth: 260 }}>{store.lastPerfTestMessage}</div>
+                      )}
+                      <form action={testStoreAdConnectionAction} style={{ marginTop: 4 }}>
+                        <input type="hidden" name="storeId" value={store.id} />
+                        <button className="btn" style={{ padding: '4px 8px', fontSize: 12 }} type="submit">
+                          Проверить
+                        </button>
+                      </form>
+                    </div>
+                  </div>
+                  </>
+                )}
               </div>
             );
           }),

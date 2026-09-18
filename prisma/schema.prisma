@@ -115,6 +115,17 @@ model Store {
   lastSyncOk          Boolean?
   lastSyncMessage     String?
   lastSyncCount       Int?
+  /// Отдельная пара ключей рекламного кабинета Ozon (Performance API) — НЕ те же Client-Id/Api-Key,
+  /// что для основного Seller API выше (ozonClientId/ozonApiKeyEncrypted): другой личный кабинет
+  /// Ozon (Продвижение → Настройки Performance API), другой способ авторизации (OAuth2
+  /// client_credentials, см. lib/integrations/ozonPerformance.ts). Пока используется только для
+  /// проверки подключения — сама статистика показов/кликов/CTR ещё не подтягивается.
+  ozonPerfClientId              String?
+  ozonPerfClientSecretEncrypted String?
+  ozonPerfClientSecretLast4     String?
+  lastPerfTestAt                DateTime?
+  lastPerfTestOk                Boolean?
+  lastPerfTestMessage           String?
   createdAt           DateTime              @default(now())
   products            Product[]
   transactions        FinanceTransaction[]
