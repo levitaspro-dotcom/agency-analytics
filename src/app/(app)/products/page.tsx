@@ -36,6 +36,26 @@ export default async function ProductsPage({
   const sort = (SORT_VALUES as readonly string[]).includes(searchParams.sort || '') ? (searchParams.sort as (typeof SORT_VALUES)[number]) : '';
 
   const allProducts = await computeProductInsights({ projectId, storeId, from, to });
+
+  // Диагностика для менеджеров: операции за период, которые не удалось привязать ни к одному
+  // товару (сумма нигде не пропадает — она всё ещё учтена в «Расходах»/«Обзоре», но не видна на
+  // этой странице ни у одного товара). externalId кодирует SKU/артикул, по которому Ozon отдал
+  // эту строку — по нему можно на глаз понять, какой именно идентификатор не совпал с товаром.
+  const unmatchedTx = canEdit
+    ? await prisma.financeTransaction.findMany({
+        where: {
+          projectId,
+          ...(storeId ? { storeId } : {}),
+          productId: null,
+          type: { in: ['REVENUE', 'OZON_FEE'] },
+          date: { gte: from, lte: to },
+        },
+        orderBy: { amount: 'desc' },
+        take: 30,
+        select: { id: true, type: true, category: true, amount: true, quantity: true, date: true, externalId: true },
+      })
+    : [];
+
   const productRows = await prisma.product.findMany({
     where: { projectId, active: true, ...(storeId ? { storeId } : {}) },
     select: { id: true, sellPrice: true, costPrice: true },
@@ -245,6 +265,42 @@ export default async function ProductsPage({
                 </tbody>
               </table>
             </div>
+            )}
+            {canEdit && unmatchedTx.length > 0 && (
+              <details style={{ marginTop: 20 }}>
+                <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--text-muted)' }}>
+                  Без привязки к товару за период: {unmatchedTx.length} (сумма не потеряна — учтена в «Расходах»/«Обзоре», но не видна выше ни у одного товара)
+                </summary>
+                <p style={{ color: 'var(--text-muted)', fontSize: 12.5, margin: '10px 0' }}>
+                  Ozon не всегда присылает по операции SKU/артикул, совпадающий с текущим товаром (например, если
+                  SKU сменился после переиздания карточки). «Ключ» ниже — то, что фактически пришло от Ozon по этой
+                  операции; по нему видно, какой именно идентификатор не совпал.
+                </p>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Тип</th>
+                      <th>Категория</th>
+                      <th>Сумма</th>
+                      <th>Кол-во</th>
+                      <th>Дата</th>
+                      <th>Ключ (externalId)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {unmatchedTx.map((t) => (
+                      <tr key={t.id}>
+                        <td>{t.type === 'REVENUE' ? 'Выручка' : 'Комиссия/сбор'}</td>
+                        <td>{t.category}</td>
+                        <td>{Math.round(t.amount).toLocaleString('ru-RU')} ₽</td>
+                        <td>{t.quantity ?? '—'}</td>
+                        <td>{t.date.toISOString().slice(0, 10)}</td>
+                        <td style={{ fontFamily: 'monospace', fontSize: 12, color: 'var(--text-muted)' }}>{t.externalId}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </details>
             )}
           </>
         )}
