@@ -157,15 +157,27 @@ export interface ProductInsight {
   otherFee: number;
   /** Сумма всех расходов по товару за период: себестоимость + все сборы Ozon. */
   totalExpenses: number;
-  /** null, если себестоимость ещё не введена — тогда маржу с единицы посчитать честно нельзя (не показываем в этом случае мнимые 100%).
-   *  Считается по ТЕКУЩЕЙ цене товара в Ozon (Product.sellPrice, обновляется при каждой синхронизации), а не по цене,
-   *  по которой товар реально продавался в выбранном периоде — Ozon часто меняет цену/скидки, поэтому эта маржа может
-   *  заметно отличаться от unitMarginPeriod ниже. Показывает «маржу, если продать по сегодняшней цене». */
+  /** ТОВАРНАЯ НАЦЕНКА (не маржинальность — см. periodMargin ниже, это разные показатели по ТЗ,
+   *  раздел 4): (цена − себестоимость) / цена, БЕЗ вычета комиссии, логистики и прочих сборов
+   *  Ozon. null, если себестоимость ещё не введена — тогда её посчитать честно нельзя (не
+   *  показываем в этом случае мнимые 100%). Считается по ТЕКУЩЕЙ цене товара в Ozon
+   *  (Product.sellPrice, обновляется при каждой синхронизации), а не по цене, по которой товар
+   *  реально продавался в выбранном периоде — Ozon часто меняет цену/скидки, поэтому это число
+   *  может заметно отличаться от unitMarginPeriod ниже. Показывает «наценка, если продать по
+   *  сегодняшней цене» — сама по себе ничего не говорит о прибыльности периода. */
   unitMargin: number | null;
-  /** Маржа по фактической средней цене продажи за период (выручка / кол-во шт), а не по текущей цене Ozon.
-   *  null, если себестоимость не введена, либо за период не было продаж (не из чего считать среднюю цену). */
+  /** ТОВАРНАЯ НАЦЕНКА по фактической средней цене продажи за период (выручка / кол-во шт), а не
+   *  по текущей цене Ozon — тоже без вычета сборов Ozon (см. unitMargin выше). null, если
+   *  себестоимость не введена, либо за период не было продаж (не из чего считать среднюю цену). */
   unitMarginPeriod: number | null;
   periodProfit: number;
+  /** НАСТОЯЩАЯ МАРЖИНАЛЬНОСТЬ по ТЗ (раздел 4): прибыль / выручка за период, ПОСЛЕ вычета
+   *  себестоимости и всех сборов Ozon (periodProfit / revenue) — не путать с unitMargin/
+   *  unitMarginPeriod выше (товарная наценка, без вычета расходов Ozon). Эти два показателя
+   *  могут отличаться в разы: наценка 76% при этом реальная маржинальность может быть
+   *  отрицательной, если расходы Ozon съели всю разницу. null, если за период не было выручки
+   *  (нечего делить). */
+  periodMargin: number | null;
   flag: 'critical' | 'warning' | null;
   reason?: string;
 }
@@ -233,6 +245,7 @@ export async function computeProductInsights(params: {
       const avgSalePrice = quantitySold > 0 ? revenue / quantitySold : null;
       const unitMarginPeriod = costKnown && avgSalePrice && avgSalePrice > 0 ? (avgSalePrice - p.costPrice) / avgSalePrice : null;
       const periodProfit = revenue - totalExpenses;
+      const periodMargin = revenue > 0 ? periodProfit / revenue : null;
       let flag: 'critical' | 'warning' | null = null;
       let reason: string | undefined;
       if (!costKnown) {
@@ -245,7 +258,7 @@ export async function computeProductInsights(params: {
         reason = 'Убыток за период: расходы на товар (себестоимость + сборы Ozon) превышают выручку по нему';
       } else if (unitMargin !== null && unitMargin < 0.1) {
         flag = 'warning';
-        reason = `Маржа с единицы (по цене Ozon) всего ${(unitMargin * 100).toFixed(1)}%`;
+        reason = `Наценка с единицы (по цене Ozon) всего ${(unitMargin * 100).toFixed(1)}% — это не маржинальность, расходы Ozon сюда ещё не вычтены`;
       } else if (revenue === 0 && totalExpenses > 0) {
         flag = 'warning';
         reason = 'Есть расходы по товару без выручки за период';
@@ -266,6 +279,7 @@ export async function computeProductInsights(params: {
         unitMargin,
         unitMarginPeriod,
         periodProfit,
+        periodMargin,
         flag,
         reason,
       };

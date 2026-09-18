@@ -32,7 +32,14 @@ export default async function ProductsPage({
   const canEdit = isManagerOrAbove(user.role);
   const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
 
-  const SORT_VALUES = ['margin_asc', 'margin_desc', 'margin_period_asc', 'margin_period_desc'] as const;
+  const SORT_VALUES = [
+    'margin_asc',
+    'margin_desc',
+    'margin_period_asc',
+    'margin_period_desc',
+    'true_margin_asc',
+    'true_margin_desc',
+  ] as const;
   const q = (searchParams.q || '').trim();
   const status = searchParams.status === 'selling' || searchParams.status === 'not_selling' ? searchParams.status : '';
   const sort = (SORT_VALUES as readonly string[]).includes(searchParams.sort || '') ? (searchParams.sort as (typeof SORT_VALUES)[number]) : '';
@@ -90,6 +97,14 @@ export default async function ProductsPage({
       if (b.unitMarginPeriod === null) return -1;
       return (a.unitMarginPeriod - b.unitMarginPeriod) * dir;
     });
+  } else if (sort === 'true_margin_asc' || sort === 'true_margin_desc') {
+    const dir = sort === 'true_margin_asc' ? 1 : -1;
+    products = [...products].sort((a, b) => {
+      if (a.periodMargin === null && b.periodMargin === null) return 0;
+      if (a.periodMargin === null) return 1;
+      if (b.periodMargin === null) return -1;
+      return (a.periodMargin - b.periodMargin) * dir;
+    });
   }
   const filtersActive = q !== '' || status !== '' || sort !== '';
 
@@ -118,10 +133,14 @@ export default async function ProductsPage({
               нет. Строки с убытком за период подсвечены.
             </p>
             <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
-              Маржи теперь две: «по цене Ozon» считается от текущей цены товара в Ozon (какая маржа была бы,
-              продай его сегодня), «по факту периода» — от реальной средней цены продажи в периоде (выручка ÷
-              кол-во шт). Ozon часто меняет цену/скидки, поэтому они могут заметно расходиться — «по факту»
-              точнее отражает, сколько реально заработано на выбранный период.
+              «Наценка» и «Маржинальность» — разные показатели, их легко перепутать. <b>Наценка</b> (два
+              столбца — «по цене Ozon» от текущей цены товара, «по факту периода» от реальной средней цены
+              продажи в периоде) — это просто (цена − себестоимость) / цена, БЕЗ вычета комиссии, логистики и
+              прочих сборов Ozon: показывает наценку «на бумаге», а не прибыльность. <b>Маржинальность</b> —
+              это прибыль / выручка за период, ПОСЛЕ вычета всех расходов (как определено в ТЗ, раздел 4) —
+              именно она показывает, сколько реально заработано. Наценка в 76% при этом легко уживается с
+              отрицательной маржинальностью, если сборы Ozon съели всю разницу — ориентируйтесь на
+              «Маржинальность», не на «Наценку».
             </p>
             {dateBasis === 'accrual' && (
               <p style={{ color: 'var(--text-muted)', fontSize: 12.5, marginTop: -8, marginBottom: 14 }}>
@@ -152,13 +171,15 @@ export default async function ProductsPage({
                 </select>
               </div>
               <div className="field">
-                <label>Сортировка по марже</label>
+                <label>Сортировка</label>
                 <select name="sort" defaultValue={sort}>
                   <option value="">По умолчанию</option>
-                  <option value="margin_desc">По цене Ozon: сначала высокая</option>
-                  <option value="margin_asc">По цене Ozon: сначала низкая</option>
-                  <option value="margin_period_desc">По факту периода: сначала высокая</option>
-                  <option value="margin_period_asc">По факту периода: сначала низкая</option>
+                  <option value="true_margin_desc">Маржинальность: сначала высокая</option>
+                  <option value="true_margin_asc">Маржинальность: сначала низкая</option>
+                  <option value="margin_desc">Наценка по цене Ozon: сначала высокая</option>
+                  <option value="margin_asc">Наценка по цене Ozon: сначала низкая</option>
+                  <option value="margin_period_desc">Наценка по факту периода: сначала высокая</option>
+                  <option value="margin_period_asc">Наценка по факту периода: сначала низкая</option>
                 </select>
               </div>
               <button className="btn btn-primary" type="submit">
@@ -198,14 +219,20 @@ export default async function ProductsPage({
                     <th>Прочие сборы Ozon</th>
                     <th>Итого расходов</th>
                     <th>Прибыль за период</th>
-                    <th className="tooltip-hint" title="(текущая цена Ozon − себестоимость) / текущая цена Ozon — маржа, если продать по сегодняшней цене">
-                      Маржа (цена Ozon)
+                    <th
+                      className="tooltip-hint"
+                      title="Прибыль / выручка за период, ПОСЛЕ вычета себестоимости и всех сборов Ozon (ТЗ, раздел 4) — настоящая маржинальность, не путать с наценкой в двух столбцах справа. «—», если за период не было выручки"
+                    >
+                      Маржинальность
+                    </th>
+                    <th className="tooltip-hint" title="Наценка «на бумаге», БЕЗ вычета комиссии/логистики/сборов Ozon: (текущая цена Ozon − себестоимость) / текущая цена Ozon — какая была бы наценка, продай товар сегодня. Не показатель прибыльности — см. «Маржинальность»">
+                      Наценка (цена Ozon)
                     </th>
                     <th
                       className="tooltip-hint"
-                      title="(выручка / кол-во шт − себестоимость) / (выручка / кол-во шт) — маржа по фактической средней цене продажи в этом периоде. «—», если за период не было продаж"
+                      title="Наценка «на бумаге», БЕЗ вычета комиссии/логистики/сборов Ozon: (выручка / кол-во шт − себестоимость) / (выручка / кол-во шт) — по фактической средней цене продажи в этом периоде. Не показатель прибыльности — см. «Маржинальность». «—», если за период не было продаж"
                     >
-                      Маржа (по факту)
+                      Наценка (по факту)
                     </th>
                     <th>Статус</th>
                   </tr>
@@ -261,12 +288,15 @@ export default async function ProductsPage({
                         <td style={{ color: p.periodProfit < 0 ? 'var(--bad)' : 'inherit', fontWeight: isLoss ? 600 : 400 }}>
                           {Math.round(p.periodProfit).toLocaleString('ru-RU')} ₽
                         </td>
-                        <td>{p.unitMargin === null ? '—' : (p.unitMargin * 100).toFixed(1) + '%'}</td>
-                        <td>{p.unitMarginPeriod === null ? '—' : (p.unitMarginPeriod * 100).toFixed(1) + '%'}</td>
+                        <td style={{ color: p.periodMargin !== null && p.periodMargin < 0 ? 'var(--bad)' : 'inherit', fontWeight: 600 }}>
+                          {p.periodMargin === null ? '—' : (p.periodMargin * 100).toFixed(1) + '%'}
+                        </td>
+                        <td style={{ color: 'var(--text-muted)' }}>{p.unitMargin === null ? '—' : (p.unitMargin * 100).toFixed(1) + '%'}</td>
+                        <td style={{ color: 'var(--text-muted)' }}>{p.unitMarginPeriod === null ? '—' : (p.unitMarginPeriod * 100).toFixed(1) + '%'}</td>
                         <td>
                           {p.flag ? (
                             <span className={`pill ${p.flag}`} title={p.reason}>
-                              {p.flag === 'critical' ? 'Убыточен' : p.unitMargin === null ? 'Нет себестоимости' : 'Низкая маржа'}
+                              {p.flag === 'critical' ? 'Убыточен' : p.unitMargin === null ? 'Нет себестоимости' : 'Низкая наценка'}
                             </span>
                           ) : (
                             <span className="pill ok">Норма</span>
