@@ -671,7 +671,11 @@ async function syncStoreAction(formData: FormData) {
   // orderBy date asc — если «зависших» строк больше лимита, каждая синхронизация постепенно
   // продвигается от самых старых к более новым (а не проверяет один и тот же первый кусок
   // без порядка сортировки), пока не закроет весь «хвост» за несколько синхронизаций подряд.
-  type StalePostingRow = { id: string; externalId: string };
+  // externalId в схеме Prisma объявлен как nullable (String?), хотя REVENUE/COGS-строки его
+  // всегда заполняют при создании — учитываем это в типе, а не считаем, что raw-объект от
+  // findMany обязательно совпадёт с более узким локальным типом (сборка на Render это как раз
+  // и поймала: тип из реальной сгенерированной Prisma-схемы здесь недоступен локально).
+  type StalePostingRow = { id: string; externalId: string | null };
   const stalePostingRows: StalePostingRow[] = await prisma.financeTransaction.findMany({
     where: { storeId: store.id, type: { in: ['REVENUE', 'COGS'] }, accrualDate: null },
     select: { id: true, externalId: true },
@@ -680,9 +684,11 @@ async function syncStoreAction(formData: FormData) {
   });
   // externalId у REVENUE/COGS-строк — "<postingNumber>:<lineKey>:revenue|cogs" (см. lineRows
   // ниже) — posting_number у Ozon без двоеточий, поэтому первый сегмент до ':' безопасно
-  // достаёт его без отдельного столбца в базе.
+  // достаёт его без отдельного столбца в базе. null пропускаем — такой строки без
+  // externalId быть не должно, но если она есть, дозапросить по ней всё равно нечего.
   const extraPostingNumberSet = new Set<string>();
   for (const row of stalePostingRows) {
+    if (!row.externalId) continue;
     const postingNumber: string = row.externalId.split(':')[0];
     if (postingNumber) extraPostingNumberSet.add(postingNumber);
   }
@@ -985,7 +991,7 @@ async function syncStoreAction(formData: FormData) {
     // напрямую по id, используя ту же postingAccrualDate, что построена из операций выше
     // (в неё уже подмешаны начисления по extraPostingNumbers — см. fetchOzonFinanceTransactions).
     for (const row of stalePostingRows) {
-      const postingNumber = row.externalId.split(':')[0];
+      const postingNumber = row.externalId ? row.externalId.split(':')[0] : undefined;
       const accrualDate = postingNumber ? postingAccrualDate.get(postingNumber) : undefined;
       if (!accrualDate) continue;
       await prisma.financeTransaction.update({ where: { id: row.id }, data: { accrualDate } });
