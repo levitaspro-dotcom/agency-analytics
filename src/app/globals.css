@@ -199,6 +199,23 @@ table.data-table tr:last-child td { border-bottom: none; }
   a[href]::after { content: none !important; }
 }
 
+.calendar-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+
+.calendar-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.calendar-cell { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+.calendar-cell.weekend { background: var(--primary-bg); }
+.calendar-cell-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.calendar-cell-date { font-size: 13.5px; font-weight: 700; }
+.calendar-cell-dow { font-size: 11.5px; color: var(--text-muted); }
+.calendar-cell-metric { display: flex; flex-direction: column; margin-bottom: 6px; }
+.calendar-cell-metric:last-child { margin-bottom: 0; }
+.calendar-cell-metric-label { font-size: 10.5px; color: var(--text-muted); }
+.calendar-cell-metric-value { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.calendar-trend { font-size: 10.5px; font-weight: 700; white-space: nowrap; }
+.calendar-trend.good { color: var(--good); }
+.calendar-trend.bad { color: var(--bad); }
+.calendar-trend.flat { color: var(--text-muted); }
+
 .login-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); }
 .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 32px; width: 340px; }
 .login-card h1 { font-size: 18px; margin: 0 0 4px; }

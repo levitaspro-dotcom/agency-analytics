@@ -117,6 +117,128 @@ export async function computeFinanceSummary(params: {
   return { revenue, ozonFees, cogs, externalExpenses, taxes, totalExpenses, profit, margin, byType, taxRatePercent };
 }
 
+export interface DailyCalendarEntry {
+  /** Локальная полночь этого дня. Группировка идёт по дате ОФОРМЛЕНИЯ заказа (FinanceTransaction.date),
+   *  а не по дате начисления Ozon — иначе у самых свежих дней в периоде клетки были бы почти
+   *  всегда пустые (начисление обычно приходит на несколько дней позже заказа, см. dateWhere). */
+  date: Date;
+  /** Продано за день, шт — сумма quantity по REVENUE-строкам с датой заказа в этот день. */
+  orderQuantity: number;
+  /** Сумма заказов за день, ₽ — сумма amount по тем же REVENUE-строкам. */
+  orderSum: number;
+  /** Реклама за день, ₽ — та же формула, что и ProductExpenseDetail.adSpend (клик + оплата за
+   *  заказ + продвижение бренда). */
+  adSpend: number;
+  /** Все расходы за день, ₽ — сборы Ozon (включая рекламу) + себестоимость + внешние расходы +
+   *  налог. Та же формула, что и FinanceSummary.totalExpenses, применённая к одному дню. */
+  totalExpenses: number;
+  /** adSpend / orderSum за день («рекламный» ДРР). null, если заказов в этот день не было. */
+  drrPercentAd: number | null;
+  /** totalExpenses / orderSum за день («общий» ДРР — какую долю выручки дня съедают вообще все
+   *  расходы, не только реклама). null, если заказов в этот день не было. */
+  drrPercentTotal: number | null;
+}
+
+function dayKey(d: Date) {
+  return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+}
+
+/**
+ * Календарная сетка «Обзора»: по одной клетке на календарный день периода (даже если в этот день
+ * не было ни одной операции — тогда клетка с нулями, а не пропуск), с разбивкой заказов/расходов/
+ * рекламы по дню. FBO/FBS-разбивка и возвраты (шт/₽) по дням сюда намеренно не включены — этих
+ * данных пока нет по дням нигде в приложении (см. обсуждение с Ольгой) — это отдельный, более
+ * трудоёмкий следующий шаг.
+ */
+export async function computeDailyCalendar(params: {
+  projectId: string;
+  storeId?: string;
+  from: Date;
+  to: Date;
+}): Promise<DailyCalendarEntry[]> {
+  const { projectId, storeId, from, to } = params;
+  const [rows, project] = await Promise.all([
+    prisma.financeTransaction.findMany({
+      where: {
+        projectId,
+        ...(storeId ? { storeId } : {}),
+        date: { gte: from, lte: to },
+      },
+      select: { type: true, category: true, amount: true, quantity: true, date: true },
+    }),
+    prisma.project.findUnique({ where: { id: projectId }, select: { taxRatePercent: true } }),
+  ]);
+  const taxRatePercent = project?.taxRatePercent ?? 0;
+
+  type Bucket = {
+    orderQuantity: number;
+    orderSum: number;
+    adSpend: number;
+    ozonFeesOther: number;
+    cogs: number;
+    externalExpenses: number;
+    manualTaxes: number;
+  };
+  const emptyBucket = (): Bucket => ({
+    orderQuantity: 0,
+    orderSum: 0,
+    adSpend: 0,
+    ozonFeesOther: 0,
+    cogs: 0,
+    externalExpenses: 0,
+    manualTaxes: 0,
+  });
+  const byDay = new Map<string, Bucket>();
+
+  for (const r of rows) {
+    const key = dayKey(r.date);
+    let b = byDay.get(key);
+    if (!b) {
+      b = emptyBucket();
+      byDay.set(key, b);
+    }
+    if (r.type === 'REVENUE') {
+      b.orderSum += r.amount;
+      b.orderQuantity += r.quantity ?? 0;
+    } else if (r.type === 'OZON_FEE') {
+      const bucket = bucketFineCategory(r.category);
+      if (bucket === 'clicks' || bucket === 'orderAds' || bucket === 'brandPromo') {
+        b.adSpend += r.amount;
+      } else {
+        b.ozonFeesOther += r.amount;
+      }
+    } else if (r.type === 'COGS') {
+      b.cogs += r.amount;
+    } else if (r.type === 'EXTERNAL_EXPENSE') {
+      b.externalExpenses += r.amount;
+    } else if (r.type === 'TAX') {
+      b.manualTaxes += r.amount;
+    }
+  }
+
+  const result: DailyCalendarEntry[] = [];
+  const cursor = new Date(from.getFullYear(), from.getMonth(), from.getDate());
+  const last = new Date(to.getFullYear(), to.getMonth(), to.getDate());
+  while (cursor.getTime() <= last.getTime()) {
+    const b = byDay.get(dayKey(cursor)) ?? emptyBucket();
+    const computedTax = taxRatePercent > 0 ? b.orderSum * (taxRatePercent / 100) : 0;
+    const taxes = b.manualTaxes + computedTax;
+    const ozonFeesTotal = b.adSpend + b.ozonFeesOther;
+    const totalExpenses = ozonFeesTotal + b.cogs + b.externalExpenses + taxes;
+    result.push({
+      date: new Date(cursor),
+      orderQuantity: b.orderQuantity,
+      orderSum: b.orderSum,
+      adSpend: b.adSpend,
+      totalExpenses,
+      drrPercentAd: b.orderSum > 0 ? b.adSpend / b.orderSum : null,
+      drrPercentTotal: b.orderSum > 0 ? totalExpenses / b.orderSum : null,
+    });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return result;
+}
+
 /**
  * Ozon-категории расходов (OZON_FEE.category — как их называет сам Ozon в ответе
  * /v1/finance/accrual/types, иногда без перевода на русский) раскладываем в несколько

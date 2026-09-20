@@ -1,7 +1,13 @@
 import { redirect } from 'next/navigation';
 import { requireUser, listAccessibleProjects, assertProjectAccess, ForbiddenError } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
-import { computeFinanceSummary, computeAttention, type CategoryBreakdown } from '@/lib/finance';
+import {
+  computeFinanceSummary,
+  computeAttention,
+  computeDailyCalendar,
+  type CategoryBreakdown,
+  type DailyCalendarEntry,
+} from '@/lib/finance';
 import { getProjectDataFreshness } from '@/lib/freshness';
 import { FilterBar } from '@/components/FilterBar';
 import { FreshnessBanner } from '@/components/FreshnessBanner';
@@ -10,6 +16,94 @@ export const dynamic = 'force-dynamic';
 
 function money(n: number) {
   return Math.round(n).toLocaleString('ru-RU') + ' ₽';
+}
+
+function pct(n: number | null) {
+  return n === null ? '—' : (n * 100).toFixed(1) + '%';
+}
+
+const DOW = ['Вс', 'Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
+
+function dayLabel(d: Date) {
+  return {
+    date: d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }),
+    dow: DOW[d.getDay()],
+  };
+}
+
+/** Стрелка тренда к предыдущему дню. higherIsGood=true — рост красим зелёным (заказы, сумма
+ *  заказов); higherIsGood=false — рост красим красным (расходы, ДРР — там рост это не радость). */
+function Trend({ curr, prev, higherIsGood }: { curr: number; prev: number | null; higherIsGood: boolean }) {
+  if (prev === null || prev === 0) return null;
+  const diff = curr - prev;
+  if (Math.abs(diff) < 0.01) return <span className="calendar-trend flat">•</span>;
+  const up = diff > 0;
+  const good = up === higherIsGood;
+  const pctChange = Math.abs(diff / prev) * 100;
+  return (
+    <span className={`calendar-trend ${good ? 'good' : 'bad'}`}>
+      {up ? '▲' : '▼'} {pctChange.toFixed(0)}%
+    </span>
+  );
+}
+
+function CalendarGrid({ days, showDynamics }: { days: DailyCalendarEntry[]; showDynamics: boolean }) {
+  if (days.length === 0) {
+    return <div className="empty-state">Нет данных за период</div>;
+  }
+  return (
+    <div className="calendar-grid">
+      {days.map((d, i) => {
+        const prev = i > 0 ? days[i - 1] : null;
+        const { date, dow } = dayLabel(d.date);
+        const isWeekend = d.date.getDay() === 0 || d.date.getDay() === 6;
+        return (
+          <div key={d.date.toISOString()} className={`calendar-cell ${isWeekend ? 'weekend' : ''}`}>
+            <div className="calendar-cell-head">
+              <span className="calendar-cell-date">{date}</span>
+              <span className="calendar-cell-dow">{dow}</span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label">Заказы, шт</span>
+              <span className="calendar-cell-metric-value">
+                {d.orderQuantity}
+                {showDynamics && <Trend curr={d.orderQuantity} prev={prev?.orderQuantity ?? null} higherIsGood />}
+              </span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label">Сумма заказов</span>
+              <span className="calendar-cell-metric-value">
+                {money(d.orderSum)}
+                {showDynamics && <Trend curr={d.orderSum} prev={prev?.orderSum ?? null} higherIsGood />}
+              </span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label">Реклама</span>
+              <span className="calendar-cell-metric-value">
+                {money(d.adSpend)}
+                {showDynamics && <Trend curr={d.adSpend} prev={prev?.adSpend ?? null} higherIsGood={false} />}
+              </span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label tooltip-hint" title="Рекламный ДРР = реклама / сумма заказов дня. Общий ДРР = все расходы дня / сумма заказов дня.">
+                ДРР реклам. / общий
+              </span>
+              <span className="calendar-cell-metric-value">
+                {pct(d.drrPercentAd)} / {pct(d.drrPercentTotal)}
+              </span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label">Расходы всего</span>
+              <span className="calendar-cell-metric-value">
+                {money(d.totalExpenses)}
+                {showDynamics && <Trend curr={d.totalExpenses} prev={prev?.totalExpenses ?? null} higherIsGood={false} />}
+              </span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function CategoryTable({ rows }: { rows: CategoryBreakdown }) {
@@ -35,7 +129,7 @@ function CategoryTable({ rows }: { rows: CategoryBreakdown }) {
 export default async function DashboardPage({
   searchParams,
 }: {
-  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string };
+  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string; dynamics?: string };
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
@@ -55,12 +149,20 @@ export default async function DashboardPage({
 
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
+  const showDynamics = searchParams.dynamics === '1';
 
-  const [summary, attention, freshness] = await Promise.all([
+  const [summary, attention, freshness, dailyCalendar] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
     computeAttention({ projectId, storeId, from, to }),
     getProjectDataFreshness(projectId, storeId),
+    computeDailyCalendar({ projectId, storeId, from, to }),
   ]);
+
+  const dynamicsToggleParamsObj: Record<string, string> = { projectId, dynamics: showDynamics ? '0' : '1' };
+  if (storeId) dynamicsToggleParamsObj.storeId = storeId;
+  if (searchParams.from) dynamicsToggleParamsObj.from = searchParams.from;
+  if (searchParams.to) dynamicsToggleParamsObj.to = searchParams.to;
+  const dynamicsToggleHref = `/dashboard?${new URLSearchParams(dynamicsToggleParamsObj).toString()}`;
 
   return (
     <div>
@@ -194,6 +296,20 @@ export default async function DashboardPage({
             ))}
           </div>
         )}
+      </div>
+
+      <div className="panel">
+        <div className="calendar-panel-head">
+          <h2 style={{ margin: 0 }}>Календарь по дням</h2>
+          <a href={dynamicsToggleHref} className="btn">
+            {showDynamics ? 'Скрыть динамику' : 'Показать динамику'}
+          </a>
+        </div>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -4, marginBottom: 14 }}>
+          По дате оформления заказа. Разбивка FBO/FBS и возвраты по дням — в следующем шаге, этих данных
+          пока нет по дням нигде в приложении.
+        </p>
+        <CalendarGrid days={dailyCalendar} showDynamics={showDynamics} />
       </div>
     </div>
   );
