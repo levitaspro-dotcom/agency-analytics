@@ -66,8 +66,15 @@ function CalendarGrid({ days, showDynamics }: { days: DailyCalendarEntry[]; show
             <div className="calendar-cell-metric">
               <span className="calendar-cell-metric-label">Заказы, шт</span>
               <span className="calendar-cell-metric-value">
-                {d.orderQuantity}
-                {showDynamics && <Trend curr={d.orderQuantity} prev={prev?.orderQuantity ?? null} higherIsGood />}
+                {d.orderCount}
+                {showDynamics && <Trend curr={d.orderCount} prev={prev?.orderCount ?? null} higherIsGood />}
+              </span>
+            </div>
+            <div className="calendar-cell-metric">
+              <span className="calendar-cell-metric-label">Продано, шт</span>
+              <span className="calendar-cell-metric-value">
+                {d.unitsSold}
+                {showDynamics && <Trend curr={d.unitsSold} prev={prev?.unitsSold ?? null} higherIsGood />}
               </span>
             </div>
             <div className="calendar-cell-metric">

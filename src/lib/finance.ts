@@ -122,8 +122,17 @@ export interface DailyCalendarEntry {
    *  а не по дате начисления Ozon — иначе у самых свежих дней в периоде клетки были бы почти
    *  всегда пустые (начисление обычно приходит на несколько дней позже заказа, см. dateWhere). */
   date: Date;
-  /** Продано за день, шт — сумма quantity по REVENUE-строкам с датой заказа в этот день. */
-  orderQuantity: number;
+  /** Кол-во ЗАКАЗОВ (отправлений) за день — количество РАЗНЫХ posting_number среди REVENUE-строк
+   *  с датой заказа в этот день (posting_number достаём из FinanceTransaction.externalId, формат
+   *  "<postingNumber>:...", см. StalePostingRow в projects/page.tsx — тот же приём). Не то же самое,
+   *  что «продано штук»: если в один заказ положили 2 единицы одного товара, это всё ещё 1 заказ,
+   *  а не 2. Раньше здесь считалось количество проданных ШТУК (сумма quantity) — Ольга уточнила,
+   *  что это не то, ей нужно именно число заказов, которые не совпадали с тем, что она видит в
+   *  кабинете Ozon. */
+  orderCount: number;
+  /** Продано, шт — сумма quantity по тем же REVENUE-строкам (сколько единиц товара ушло за день,
+   *  может быть больше orderCount, если в заказах бывает не по одной штуке). */
+  unitsSold: number;
   /** Сумма заказов за день, ₽ — сумма amount по тем же REVENUE-строкам. */
   orderSum: number;
   /** Реклама за день, ₽ — та же формула, что и ProductExpenseDetail.adSpend (клик + оплата за
@@ -164,14 +173,15 @@ export async function computeDailyCalendar(params: {
         ...(storeId ? { storeId } : {}),
         date: { gte: from, lte: to },
       },
-      select: { type: true, category: true, amount: true, quantity: true, date: true },
+      select: { type: true, category: true, amount: true, quantity: true, date: true, externalId: true },
     }),
     prisma.project.findUnique({ where: { id: projectId }, select: { taxRatePercent: true } }),
   ]);
   const taxRatePercent = project?.taxRatePercent ?? 0;
 
   type Bucket = {
-    orderQuantity: number;
+    postingNumbers: Set<string>;
+    unitsSold: number;
     orderSum: number;
     adSpend: number;
     ozonFeesOther: number;
@@ -180,7 +190,8 @@ export async function computeDailyCalendar(params: {
     manualTaxes: number;
   };
   const emptyBucket = (): Bucket => ({
-    orderQuantity: 0,
+    postingNumbers: new Set<string>(),
+    unitsSold: 0,
     orderSum: 0,
     adSpend: 0,
     ozonFeesOther: 0,
@@ -199,7 +210,15 @@ export async function computeDailyCalendar(params: {
     }
     if (r.type === 'REVENUE') {
       b.orderSum += r.amount;
-      b.orderQuantity += r.quantity ?? 0;
+      b.unitsSold += r.quantity ?? 0;
+      // externalId у REVENUE-строк — "<postingNumber>:<lineKey>:revenue" (см. projects/page.tsx),
+      // posting_number у Ozon без двоеточий, поэтому первый сегмент до ':' — он и есть. Пусто/null
+      // не должно встречаться у REVENUE-строк (заполняется при создании), но на всякий случай
+      // просто не считаем такую строку отдельным заказом, а не падаем.
+      if (r.externalId) {
+        const postingNumber = r.externalId.split(':')[0];
+        if (postingNumber) b.postingNumbers.add(postingNumber);
+      }
     } else if (r.type === 'OZON_FEE') {
       const bucket = bucketFineCategory(r.category);
       if (bucket === 'clicks' || bucket === 'orderAds' || bucket === 'brandPromo') {
@@ -227,7 +246,8 @@ export async function computeDailyCalendar(params: {
     const totalExpenses = ozonFeesTotal + b.cogs + b.externalExpenses + taxes;
     result.push({
       date: new Date(cursor),
-      orderQuantity: b.orderQuantity,
+      orderCount: b.postingNumbers.size,
+      unitsSold: b.unitsSold,
       orderSum: b.orderSum,
       adSpend: b.adSpend,
       totalExpenses,
