@@ -199,8 +199,6 @@ table.data-table tr:last-child td { border-bottom: none; }
   a[href]::after { content: none !important; }
 }
 
-.calendar-panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
-
 .calendar-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
 .calendar-cell { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
 .calendar-cell.weekend { background: var(--primary-bg); }

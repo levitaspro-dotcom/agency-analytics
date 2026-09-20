@@ -129,7 +129,7 @@ function CategoryTable({ rows }: { rows: CategoryBreakdown }) {
 export default async function DashboardPage({
   searchParams,
 }: {
-  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string; dynamics?: string };
+  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string };
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
@@ -149,7 +149,6 @@ export default async function DashboardPage({
 
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
-  const showDynamics = searchParams.dynamics === '1';
 
   const [summary, attention, freshness, dailyCalendar] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
@@ -157,12 +156,6 @@ export default async function DashboardPage({
     getProjectDataFreshness(projectId, storeId),
     computeDailyCalendar({ projectId, storeId, from, to }),
   ]);
-
-  const dynamicsToggleParamsObj: Record<string, string> = { projectId, dynamics: showDynamics ? '0' : '1' };
-  if (storeId) dynamicsToggleParamsObj.storeId = storeId;
-  if (searchParams.from) dynamicsToggleParamsObj.from = searchParams.from;
-  if (searchParams.to) dynamicsToggleParamsObj.to = searchParams.to;
-  const dynamicsToggleHref = `/dashboard?${new URLSearchParams(dynamicsToggleParamsObj).toString()}`;
 
   return (
     <div>
@@ -272,6 +265,15 @@ export default async function DashboardPage({
       </div>
 
       <div className="panel">
+        <h2>Календарь по дням</h2>
+        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
+          По дате оформления заказа. Стрелки — изменение к предыдущему дню. Разбивка FBO/FBS и
+          возвраты по дням — в следующем шаге, этих данных пока нет по дням нигде в приложении.
+        </p>
+        <CalendarGrid days={dailyCalendar} showDynamics />
+      </div>
+
+      <div className="panel">
         <h2>Требует внимания</h2>
         {attention.length === 0 ? (
           <div className="empty-state">Явных проблем за период не найдено.</div>
@@ -296,20 +298,6 @@ export default async function DashboardPage({
             ))}
           </div>
         )}
-      </div>
-
-      <div className="panel">
-        <div className="calendar-panel-head">
-          <h2 style={{ margin: 0 }}>Календарь по дням</h2>
-          <a href={dynamicsToggleHref} className="btn">
-            {showDynamics ? 'Скрыть динамику' : 'Показать динамику'}
-          </a>
-        </div>
-        <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -4, marginBottom: 14 }}>
-          По дате оформления заказа. Разбивка FBO/FBS и возвраты по дням — в следующем шаге, этих данных
-          пока нет по дням нигде в приложении.
-        </p>
-        <CalendarGrid days={dailyCalendar} showDynamics={showDynamics} />
       </div>
     </div>
   );
