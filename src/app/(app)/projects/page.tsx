@@ -651,9 +651,46 @@ async function syncStoreAction(formData: FormData) {
     }
   }
 
+  // «Зависшие» продажи — REVENUE/COGS-строки этого магазина, у которых до сих пор нет
+  // accrualDate (даты начисления Ozon). Раньше accrualDate дозаполнялся только если та же
+  // самая продажа (по дате ЗАКАЗА) снова попадала в окно [from, to] этой синхронизации — а
+  // дата заказа рано или поздно «вываливается» из скользящего окна (по умолчанию days=30
+  // от «сейчас»), после чего дозаполнить accrualDate было уже нечем: заказ больше не
+  // находится через /v3/posting/fbs/list · /v2/posting/fbo/list по [from, to]. Из-за этого
+  // «Период по дате начисления» (переключатель на «Товарах») мог годами оставаться пустым
+  // для части или вообще всех продаж магазина — обнаружено на реальном примере (Ольга
+  // сверила с официальным «Отчётом по начислениям» Ozon: по нему 3 шт за период, у нас
+  // «Продано» показывало 1 — 2 других заказа были оформлены раньше выбранного периода, и их
+  // accrualDate так и не заполнился). /v1/finance/accrual/postings принимает posting_number
+  // без фильтра по дате — значит, начисление по отправлению любого возраста можно
+  // дозапросить отдельно, не дожидаясь, пока дата заказа снова попадёт в окно синхронизации.
+  // Ограничиваем количество за один раз (лимит страницы Ozon для этого метода — 200
+  // posting_number), чтобы не раздувать один запрос синхронизации — если «хвост» больше,
+  // он закроется за несколько следующих синхронизаций.
+  const MAX_EXTRA_POSTING_BACKFILL = 300;
+  // orderBy date asc — если «зависших» строк больше лимита, каждая синхронизация постепенно
+  // продвигается от самых старых к более новым (а не проверяет один и тот же первый кусок
+  // без порядка сортировки), пока не закроет весь «хвост» за несколько синхронизаций подряд.
+  type StalePostingRow = { id: string; externalId: string };
+  const stalePostingRows: StalePostingRow[] = await prisma.financeTransaction.findMany({
+    where: { storeId: store.id, type: { in: ['REVENUE', 'COGS'] }, accrualDate: null },
+    select: { id: true, externalId: true },
+    orderBy: { date: 'asc' },
+    take: MAX_EXTRA_POSTING_BACKFILL,
+  });
+  // externalId у REVENUE/COGS-строк — "<postingNumber>:<lineKey>:revenue|cogs" (см. lineRows
+  // ниже) — posting_number у Ozon без двоеточий, поэтому первый сегмент до ':' безопасно
+  // достаёт его без отдельного столбца в базе.
+  const extraPostingNumberSet = new Set<string>();
+  for (const row of stalePostingRows) {
+    const postingNumber: string = row.externalId.split(':')[0];
+    if (postingNumber) extraPostingNumberSet.add(postingNumber);
+  }
+  const extraPostingNumbers: string[] = Array.from(extraPostingNumberSet);
+
   let syncResult: { ok: boolean; message: string; operations: OzonOperation[]; productLines: OzonPostingProductLine[] };
   try {
-    syncResult = await fetchOzonFinanceTransactions(creds, from, to);
+    syncResult = await fetchOzonFinanceTransactions(creds, from, to, extraPostingNumbers);
   } catch (e) {
     syncResult = { ok: false, message: (e as Error).message, operations: [], productLines: [] };
   }
@@ -940,6 +977,19 @@ async function syncStoreAction(formData: FormData) {
     if (allNewRows.length > 0) {
       const created = await prisma.financeTransaction.createMany({ data: allNewRows, skipDuplicates: true });
       imported = created.count;
+    }
+
+    // Дозаполнение accrualDate у «зависших» строк (см. extraPostingNumbers/stalePostingRows
+    // выше) — их posting_number не входит в lineRows этой синхронизации (дата ЗАКАЗА уже вне
+    // [from, to]), поэтому обычный цикл дозаполнения по lineRows их не увидит. Обновляем
+    // напрямую по id, используя ту же postingAccrualDate, что построена из операций выше
+    // (в неё уже подмешаны начисления по extraPostingNumbers — см. fetchOzonFinanceTransactions).
+    for (const row of stalePostingRows) {
+      const postingNumber = row.externalId.split(':')[0];
+      const accrualDate = postingNumber ? postingAccrualDate.get(postingNumber) : undefined;
+      if (!accrualDate) continue;
+      await prisma.financeTransaction.update({ where: { id: row.id }, data: { accrualDate } });
+      backfilledAccrualDate += 1;
     }
   }
 

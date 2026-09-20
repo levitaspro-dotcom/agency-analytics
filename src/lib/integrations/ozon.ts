@@ -452,10 +452,17 @@ export async function fetchOzonFinanceTransactions(
   creds: OzonCredentials,
   dateFrom: Date,
   dateTo: Date,
+  // Посторонние (вне [dateFrom, dateTo] по дате заказа) posting_number, для которых нужно
+  // ДОЗАПРОСИТЬ начисления — см. комментарий у extraPostingNumbers в syncStoreAction
+  // (projects/page.tsx): так закрываем «зависшие» продажи прошлых периодов, чья дата
+  // начисления Ozon ещё не подтянулась. /v1/finance/accrual/postings принимает posting_number
+  // без фильтра по дате — можно спросить про отправление любого возраста.
+  extraPostingNumbers: string[] = [],
 ): Promise<OzonSyncResult> {
   const operations: OzonOperation[] = [];
 
-  const { postingNumbers, productLines, errors: postingErrors } = await fetchPostingNumbers(creds, dateFrom, dateTo);
+  const { postingNumbers: freshPostingNumbers, productLines, errors: postingErrors } = await fetchPostingNumbers(creds, dateFrom, dateTo);
+  const postingNumbers = Array.from(new Set([...freshPostingNumbers, ...extraPostingNumbers]));
   if (postingNumbers.length === 0) {
     if (postingErrors.length > 0) {
       return { ok: false, message: `Не удалось получить список отправлений: ${postingErrors.join('; ')}`, operations, productLines: [] };
@@ -463,13 +470,17 @@ export async function fetchOzonFinanceTransactions(
     return { ok: true, message: 'За период нет отправлений (заказов) — операций для загрузки нет.', operations, productLines: [] };
   }
 
-  if (productLines.length === 0) {
+  if (productLines.length === 0 && freshPostingNumbers.length > 0) {
     // Отправления есть, но ни в одном не нашлось состава заказа (products[]) — раньше
     // это поле не использовалось и могло незаметно поменять формат. Не показываем тихий
-    // ноль по выручке — просим прислать пример для донастройки.
+    // ноль по выручке — просим прислать пример для донастройки. Проверяем именно
+    // freshPostingNumbers (найденные за [dateFrom, dateTo]), а не итоговый postingNumbers —
+    // если за период вообще не было новых отправлений и мы здесь только из-за
+    // extraPostingNumbers (дозапрос начислений для старых продаж, см. комментарий выше),
+    // это не ошибка формата, а нормальный день без новых заказов.
     return {
       ok: false,
-      message: `Отправлений за период: ${postingNumbers.length}, но ни в одном не нашлось состава заказа (products[]) — не могу посчитать выручку. Нужна проверка формата ответа /v3/posting/fbs/list · /v2/posting/fbo/list.`,
+      message: `Отправлений за период: ${freshPostingNumbers.length}, но ни в одном не нашлось состава заказа (products[]) — не могу посчитать выручку. Нужна проверка формата ответа /v3/posting/fbs/list · /v2/posting/fbo/list.`,
       operations,
       productLines: [],
     };
@@ -526,9 +537,10 @@ export async function fetchOzonFinanceTransactions(
   const notePosting = postingErrors.length > 0 ? ` (не удалось проверить часть отправлений: ${postingErrors.join('; ')})` : '';
   const noteTypeNames = typeNamesDiagnostic ? ` · названия категорий не распознаны (${typeNamesDiagnostic})` : '';
   const noteNonItem = nonItemErrors.length > 0 ? ` · периодические начисления получены не за все дни (${nonItemErrors.length} из ${dateRangeDays(dateFrom, dateTo).length} дней с ошибкой)` : '';
+  const noteExtra = extraPostingNumbers.length > 0 ? ` · дозапрошено начислений по старым продажам: ${extraPostingNumbers.length}` : '';
   return {
     ok: true,
-    message: `Отправлений за период: ${postingNumbers.length}. Товарных строк (выручка): ${productLines.length}. Расходных операций: ${operations.length - nonItemOps.length}. Периодических начислений (реклама/эквайринг/доставка и т.п., не по отправлениям): ${nonItemOps.length}${notePosting}${noteTypeNames}${noteNonItem}`,
+    message: `Отправлений за период: ${freshPostingNumbers.length}. Товарных строк (выручка): ${productLines.length}. Расходных операций: ${operations.length - nonItemOps.length}. Периодических начислений (реклама/эквайринг/доставка и т.п., не по отправлениям): ${nonItemOps.length}${notePosting}${noteTypeNames}${noteNonItem}${noteExtra}`,
     operations,
     productLines,
   };
