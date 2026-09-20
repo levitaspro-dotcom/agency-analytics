@@ -117,33 +117,6 @@ export default async function DashboardPage({
       </div>
 
       <div className="panel">
-        <h2>Требует внимания</h2>
-        {attention.length === 0 ? (
-          <div className="empty-state">Явных проблем за период не найдено.</div>
-        ) : (
-          <div className="attention-list">
-            {attention.map((a, i) => (
-              <div key={i} className={`attention-item ${a.severity}`}>
-                <span className="attention-badge">{a.severity === 'critical' ? 'Важно' : 'Проверить'}</span>
-                <div>
-                  <div className="attention-title">
-                    {a.title}
-                    {a.href && (
-                      <>
-                        {' '}
-                        · <a href={a.href}>Подробнее</a>
-                      </>
-                    )}
-                  </div>
-                  <div className="attention-detail">{a.detail}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      <div className="panel">
         <h2>Из чего складывается результат</h2>
         <p style={{ color: 'var(--text-muted)', fontSize: 13.5, marginTop: -8, marginBottom: 14 }}>
           Нажмите на любой шаг, чтобы увидеть его состав
@@ -194,6 +167,33 @@ export default async function DashboardPage({
             <div className="chain-value">{money(summary.profit)}</div>
           </div>
         </div>
+      </div>
+
+      <div className="panel">
+        <h2>Требует внимания</h2>
+        {attention.length === 0 ? (
+          <div className="empty-state">Явных проблем за период не найдено.</div>
+        ) : (
+          <div className="attention-list">
+            {attention.map((a, i) => (
+              <div key={i} className={`attention-item ${a.severity}`}>
+                <span className="attention-badge">{a.severity === 'critical' ? 'Важно' : 'Проверить'}</span>
+                <div>
+                  <div className="attention-title">
+                    {a.title}
+                    {a.href && (
+                      <>
+                        {' '}
+                        · <a href={a.href}>Подробнее</a>
+                      </>
+                    )}
+                  </div>
+                  <div className="attention-detail">{a.detail}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );
