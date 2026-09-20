@@ -1,6 +1,6 @@
 import { requireUser, listAccessibleProjects, assertProjectAccess } from '@/lib/authz';
 import { resolvePeriod, formatDate } from '@/lib/period';
-import { computeFinanceSummary, computeProductInsights, computeProductExpenseDetail, type CategoryBreakdown } from '@/lib/finance';
+import { computeFinanceSummary, computeProductInsights, computeProductExpenseDetail, dateWhere, type CategoryBreakdown, type DateBasis } from '@/lib/finance';
 import { translateCategory } from '@/lib/categoryLabels';
 import { prisma } from '@/lib/prisma';
 import { FilterBar } from '@/components/FilterBar';
@@ -47,7 +47,7 @@ function qtyCell(n: number | null) {
 export default async function ExpensesPage({
   searchParams,
 }: {
-  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string };
+  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string; dateBasis?: string };
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
@@ -57,13 +57,20 @@ export default async function ExpensesPage({
   await assertProjectAccess(user, projectId);
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
+  // «По дате заказа» (как раньше) или «по дате начисления Ozon» — тот же переключатель, что уже
+  // есть на «Товарах» (см. lib/finance.ts DateBasis/dateWhere). Раньше эта страница ВСЕГДА считала
+  // по дате заказа, без возможности переключить — из-за этого сравнение построчно с официальным
+  // «Отчётом по начислениям» Ozon (который сам считает по дате начисления) не сходилось: разное
+  // количество заказов в периоде, а не ошибка в деньгах. Ольга поймала это на Артемизин-М —
+  // «Продано» здесь показывало 1 шт (по дате заказа), а в её отчёте 3 шт (по дате начисления).
+  const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
 
   // computeFinanceSummary — тот же расчёт, что и на «Обзоре»/«Отчётах»: суммы по категориям здесь
   // уже переведены на русский (см. translateCategory в lib/finance.ts) и, важно, здесь ЕСТЬ налог —
   // включая расчётный (ставка проекта × выручка), которого нет как отдельной сохранённой операции
   // (раньше эта страница считала категории сама, напрямую по FinanceTransaction, и расчётный налог
   // из-за этого никогда сюда не попадал).
-  const summary = await computeFinanceSummary({ projectId, storeId, from, to });
+  const summary = await computeFinanceSummary({ projectId, storeId, from, to, dateBasis });
 
   const groups: { key: keyof typeof TYPE_LABEL; label: string; amount: number; rows: CategoryBreakdown }[] = [
     { key: 'OZON_FEE', label: TYPE_LABEL.OZON_FEE, amount: summary.ozonFees, rows: summary.byType.OZON_FEE },
@@ -74,12 +81,16 @@ export default async function ExpensesPage({
   const hasAnyExpenses = groups.some((g) => g.amount > 0);
   const hasComputedTax = summary.byType.TAX.some((r) => r.category.startsWith('Налог по ставке'));
 
+  // dateWhere здесь же, что и в computeFinanceSummary — в режиме «начисления» строки без
+  // accrualDate (ручные EXTERNAL_EXPENSE/TAX его никогда не получают, только синхронизированные
+  // с Ozon REVENUE/COGS/OZON_FEE) в список не попадают, тем же намеренным образом, что и везде
+  // в приложении при этом режиме — см. комментарий у DateBasis в lib/finance.ts.
   const rows = await prisma.financeTransaction.findMany({
     where: {
       projectId,
       ...(storeId ? { storeId } : {}),
       type: { in: ['OZON_FEE', 'COGS', 'EXTERNAL_EXPENSE', 'TAX'] },
-      date: { gte: from, lte: to },
+      ...dateWhere(dateBasis, from, to),
     },
     orderBy: { date: 'desc' },
     include: { product: true },
@@ -89,7 +100,7 @@ export default async function ExpensesPage({
   // проданных штук × текущей себестоимости (та же логика, что и на странице «Товары»), а не
   // берётся из сохранённых COGS-строк выше — так сумма не занижается, если себестоимость ввели
   // уже после последней синхронизации (см. комментарий в lib/finance.ts computeProductInsights).
-  const productInsights = await computeProductInsights({ projectId, storeId, from, to, dateBasis: 'order' });
+  const productInsights = await computeProductInsights({ projectId, storeId, from, to, dateBasis });
   const soldProducts = productInsights
     .filter((p) => p.quantitySold > 0)
     .sort((a, b) => b.cogsFromTx - a.cogsFromTx);
@@ -102,7 +113,7 @@ export default async function ExpensesPage({
   // категориям (а не 4 укрупнённые группы, как на «Товарах»), плюс данные из «Позаказного отчёта о
   // реализации» (штрихкод, доставлено/возвращено, баллы/партнёрские программы) — см. комментарии в
   // lib/finance.ts (computeProductExpenseDetail) о том, почему часть столбцов может быть «—».
-  const detailAll = await computeProductExpenseDetail({ projectId, storeId, from, to, dateBasis: 'order' });
+  const detailAll = await computeProductExpenseDetail({ projectId, storeId, from, to, dateBasis });
   const detail = detailAll.filter((p) => p.quantitySold > 0 || p.revenue > 0 || p.totalExpenses > 0);
   const detailTotals = detail.reduce(
     (acc, p) => {
@@ -121,7 +132,19 @@ export default async function ExpensesPage({
 
   return (
     <div>
-      <FilterBar basePath="/expenses" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
+      <FilterBar basePath="/expenses" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} dateBasis={dateBasis} />
+
+      {dateBasis === 'accrual' && (
+        <p style={{ color: 'var(--text-muted)', fontSize: 12.5, margin: '0 0 14px' }}>
+          Период сейчас считается «по дате начисления Ozon» — так же, как в официальном «Отчёте по
+          начислениям» Ozon: строка попадает в подсчёт только после того, как Ozon фактически провёл
+          начисление по отправлению (обычно на несколько дней позже оформления заказа), а не в момент
+          оформления заказа. Поэтому «Продано, шт» и суммы здесь могут отличаться от режима «по дате
+          заказа» — это ожидаемо, а не ошибка: так корректно сверяться построчно с этим отчётом Ozon.
+          Строки без даты начисления (Ozon её ещё не провёл) в этом режиме не учитываются — так же,
+          как их не будет и в самом отчёте Ozon за этот период.
+        </p>
+      )}
 
       <div className="panel">
         <h2>Все расходы за период</h2>
@@ -339,7 +362,9 @@ export default async function ExpensesPage({
           выручка по нему в текущий период ещё не попала. На более широком периоде (месяц и больше, особенно
           уже закрытый) это расхождение сглаживается и комиссия возвращается к ожидаемому проценту от выручки.
           Для оценки прибыльности конкретного товара доверяйте более широкому периоду, а не последним
-          нескольким дням.
+          нескольким дням — либо переключите «Период по дате» вверху на «Начисления Ozon»: тогда и
+          «Продано», и все сборы будут посчитаны по одной и той же дате, так же, как в официальном
+          «Отчёте по начислениям» Ozon, и сравнивать со своим экспортом можно будет строка в строку.
         </p>
         {detail.length === 0 ? (
           <div className="empty-state">За период нет ни продаж, ни расходов по товарам.</div>
