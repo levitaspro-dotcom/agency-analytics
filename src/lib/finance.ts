@@ -7,6 +7,10 @@ export type CategoryBreakdown = { category: string; amount: number }[];
 
 export interface FinanceSummary {
   revenue: number;
+  /** Все сборы и комиссии Ozon ЗА ПЕРИОД, включая рекламу (для обратной совместимости с местами,
+   *  где расходы Ozon считаются одной суммой — /expenses, /reports, /agency, ИИ-аналитик). Для
+   *  отображения на дашборде, где рекламу показывают отдельным шагом, используйте
+   *  ozonFeesExclAds + adSpend (в сумме дают то же самое, что и ozonFees). */
   ozonFees: number;
   cogs: number;
   externalExpenses: number;
@@ -17,6 +21,15 @@ export interface FinanceSummary {
   byType: Record<TransactionType, CategoryBreakdown>;
   /** Ставка налога проекта (%), если задана — только для отображения рядом с суммой налога. */
   taxRatePercent: number;
+  /** Расходы на рекламу (клики, продвижение заказов, продвижение бренда) — подмножество OZON_FEE,
+   *  уже включённое в ozonFees/totalExpenses/profit выше (не считать отдельно поверх них!). Выделено
+   *  для дашборда, где рекламу показывают отдельным шагом цепочки. */
+  adSpend: number;
+  adSpendCategories: CategoryBreakdown;
+  /** Комиссии и сборы Ozon БЕЗ рекламы: ozonFees минус adSpend. Тоже подмножество, уже включённое
+   *  в totalExpenses/profit — только для отображения. */
+  ozonFeesExclAds: number;
+  ozonFeesExclAdsCategories: CategoryBreakdown;
 }
 
 export type DateBasis = 'order' | 'accrual';
@@ -90,6 +103,21 @@ export async function computeFinanceSummary(params: {
 
   const revenue = byTypeRaw.REVENUE.reduce((s, r) => s + r.amount, 0);
   const ozonFees = byTypeRaw.OZON_FEE.reduce((s, r) => s + r.amount, 0);
+  // Реклама — подмножество OZON_FEE (клики, продвижение заказов, продвижение бренда), выделяем
+  // тем же bucketFineCategory(), что уже используется в computeDailyCalendar. adSpend + ozonFeesExclAds
+  // = ozonFees всегда, это просто разбивка одной и той же суммы для отображения на дашборде.
+  const adSpendRows: { category: string; amount: number }[] = [];
+  const ozonFeesExclAdsRows: { category: string; amount: number }[] = [];
+  for (const r of byTypeRaw.OZON_FEE) {
+    const bucket = bucketFineCategory(r.category);
+    if (bucket === 'clicks' || bucket === 'orderAds' || bucket === 'brandPromo') {
+      adSpendRows.push(r);
+    } else {
+      ozonFeesExclAdsRows.push(r);
+    }
+  }
+  const adSpend = adSpendRows.reduce((s, r) => s + r.amount, 0);
+  const ozonFeesExclAds = ozonFeesExclAdsRows.reduce((s, r) => s + r.amount, 0);
   const cogs = byTypeRaw.COGS.reduce((s, r) => s + r.amount, 0);
   const externalExpenses = byTypeRaw.EXTERNAL_EXPENSE.reduce((s, r) => s + r.amount, 0);
   const taxRatePercent = project?.taxRatePercent ?? 0;
@@ -114,7 +142,22 @@ export async function computeFinanceSummary(params: {
     TAX: taxCategories,
   } as Record<TransactionType, CategoryBreakdown>;
 
-  return { revenue, ozonFees, cogs, externalExpenses, taxes, totalExpenses, profit, margin, byType, taxRatePercent };
+  return {
+    revenue,
+    ozonFees,
+    cogs,
+    externalExpenses,
+    taxes,
+    totalExpenses,
+    profit,
+    margin,
+    byType,
+    taxRatePercent,
+    adSpend,
+    adSpendCategories: sumByCategory(adSpendRows),
+    ozonFeesExclAds,
+    ozonFeesExclAdsCategories: sumByCategory(ozonFeesExclAdsRows),
+  };
 }
 
 export interface DailyCalendarEntry {

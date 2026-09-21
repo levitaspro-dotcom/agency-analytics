@@ -1,6 +1,6 @@
 import { redirect } from 'next/navigation';
 import { requireUser, listAccessibleProjects, assertProjectAccess, ForbiddenError } from '@/lib/authz';
-import { resolvePeriod, formatDate } from '@/lib/period';
+import { resolvePeriod, formatDate, previousPeriod } from '@/lib/period';
 import {
   computeFinanceSummary,
   computeAttention,
@@ -106,6 +106,18 @@ function CalendarGrid({ days, showDynamics }: { days: DailyCalendarEntry[]; show
   );
 }
 
+/** Серая строка под шагом цепочки: доля от выручки (%) + цветная динамика к прошлому периоду
+ *  такой же длины (переиспользует Trend — она сама ничего не рисует, если prev нет/0). */
+function ChainSub({ value, revenue, prev, higherIsGood }: { value: number; revenue: number; prev: number | null; higherIsGood: boolean }) {
+  const percent = revenue > 0 ? (value / revenue) * 100 : null;
+  return (
+    <div className="chain-sub">
+      {percent !== null && <span className="chain-percent">{percent.toFixed(1)}%</span>}
+      <Trend curr={value} prev={prev} higherIsGood={higherIsGood} />
+    </div>
+  );
+}
+
 function CategoryTable({ rows }: { rows: CategoryBreakdown }) {
   if (rows.length === 0) {
     return <div className="chain-detail" style={{ color: 'var(--text-muted)' }}>Нет операций за период</div>;
@@ -149,9 +161,11 @@ export default async function DashboardPage({
 
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
+  const prevPeriod = previousPeriod(from, to);
 
-  const [summary, attention, freshness, dailyCalendar] = await Promise.all([
+  const [summary, prevSummary, attention, freshness, dailyCalendar] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
+    computeFinanceSummary({ projectId, storeId, from: prevPeriod.from, to: prevPeriod.to }),
     computeAttention({ projectId, storeId, from, to }),
     getProjectDataFreshness(projectId, storeId),
     computeDailyCalendar({ projectId, storeId, from, to }),
@@ -228,9 +242,19 @@ export default async function DashboardPage({
           <details className="chain-step">
             <summary>
               <div className="chain-label">Расходы Ozon</div>
-              <div className="chain-value">−{money(summary.ozonFees)}</div>
+              <div className="chain-value">−{money(summary.ozonFeesExclAds)}</div>
+              <ChainSub value={summary.ozonFeesExclAds} revenue={summary.revenue} prev={prevSummary.ozonFeesExclAds} higherIsGood={false} />
             </summary>
-            <CategoryTable rows={summary.byType.OZON_FEE} />
+            <CategoryTable rows={summary.ozonFeesExclAdsCategories} />
+          </details>
+          <span className="chain-arrow">→</span>
+          <details className="chain-step">
+            <summary>
+              <div className="chain-label">Реклама</div>
+              <div className="chain-value">−{money(summary.adSpend)}</div>
+              <ChainSub value={summary.adSpend} revenue={summary.revenue} prev={prevSummary.adSpend} higherIsGood={false} />
+            </summary>
+            <CategoryTable rows={summary.adSpendCategories} />
           </details>
           <span className="chain-arrow">→</span>
           <details className="chain-step">
@@ -253,6 +277,7 @@ export default async function DashboardPage({
             <summary>
               <div className="chain-label">Налоги</div>
               <div className="chain-value">−{money(summary.taxes)}</div>
+              <ChainSub value={summary.taxes} revenue={summary.revenue} prev={prevSummary.taxes} higherIsGood={false} />
             </summary>
             <CategoryTable rows={summary.byType.TAX} />
           </details>
@@ -260,6 +285,7 @@ export default async function DashboardPage({
           <div className="chain-step" style={{ background: 'var(--primary-bg)', borderColor: '#cfe0fd' }}>
             <div className="chain-label">Прибыль</div>
             <div className="chain-value">{money(summary.profit)}</div>
+            <ChainSub value={summary.profit} revenue={summary.revenue} prev={prevSummary.profit} higherIsGood />
           </div>
         </div>
       </div>
