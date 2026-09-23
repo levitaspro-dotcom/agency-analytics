@@ -103,6 +103,8 @@ export interface OzonPostingProductLine {
   name?: string;
   price: number;
   quantity: number;
+  /** Статус отправления (posting.status): delivered / cancelled / delivering / awaiting_* и т.п. */
+  status?: string;
 }
 
 export interface OzonSyncResult {
@@ -131,6 +133,7 @@ function extractProductLines(posting: any): OzonPostingProductLine[] {
   if (!postingNumber) return [];
   const date = posting?.in_process_at ?? posting?.shipment_date ?? posting?.created_at ?? new Date().toISOString();
   const items: any[] = Array.isArray(posting?.products) ? posting.products : [];
+  const status = posting?.status ? String(posting.status) : undefined;
   const lines: OzonPostingProductLine[] = [];
   for (const it of items) {
     const price = Number(it?.price) || 0;
@@ -144,6 +147,7 @@ function extractProductLines(posting: any): OzonPostingProductLine[] {
       name: it?.name ? String(it.name) : undefined,
       price,
       quantity,
+      status,
     });
   }
   return lines;

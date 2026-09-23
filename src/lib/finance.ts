@@ -758,3 +758,44 @@ export async function computeAttention(params: {
 
   return items;
 }
+
+export interface OrderUnitsSummary {
+  /** Заказано, шт — сумма quantity по всем строкам состава заказа (REVENUE с quantity) с датой
+   *  оформления в периоде, включая отменённые и ещё не доставленные — как «Заказано» в кабинете Ozon. */
+  orderedUnits: number;
+  /** Выкуплено, шт — из тех же заказов периода только те, чьё отправление в статусе «delivered». */
+  deliveredUnits: number;
+  /** Отменено, шт — статус «cancelled». */
+  cancelledUnits: number;
+  /** Сколько штук из orderedUnits вообще имеют статус. Если 0 при orderedUnits > 0 — строки
+   *  синхронизированы до появления поля postingStatus, нужна повторная синхронизация магазина. */
+  unitsWithStatus: number;
+}
+
+export async function computeOrderUnits(params: {
+  projectId: string;
+  storeId?: string;
+  from: Date;
+  to: Date;
+}): Promise<OrderUnitsSummary> {
+  const { projectId, storeId, from, to } = params;
+  const rows = await prisma.financeTransaction.findMany({
+    where: {
+      projectId,
+      ...(storeId ? { storeId } : {}),
+      type: 'REVENUE',
+      quantity: { not: null },
+      date: { gte: from, lte: to },
+    },
+    select: { quantity: true, postingStatus: true },
+  });
+  const res: OrderUnitsSummary = { orderedUnits: 0, deliveredUnits: 0, cancelledUnits: 0, unitsWithStatus: 0 };
+  for (const r of rows) {
+    const q = r.quantity ?? 0;
+    res.orderedUnits += q;
+    if (r.postingStatus) res.unitsWithStatus += q;
+    if (r.postingStatus === 'delivered') res.deliveredUnits += q;
+    if (r.postingStatus === 'cancelled') res.cancelledUnits += q;
+  }
+  return res;
+}

@@ -5,6 +5,7 @@ import {
   computeFinanceSummary,
   computeAttention,
   computeDailyCalendar,
+  computeOrderUnits,
   type CategoryBreakdown,
   type DailyCalendarEntry,
 } from '@/lib/finance';
@@ -163,13 +164,17 @@ export default async function DashboardPage({
   const { from, to } = resolvePeriod(searchParams);
   const prevPeriod = previousPeriod(from, to);
 
-  const [summary, prevSummary, attention, freshness, dailyCalendar] = await Promise.all([
+  const [summary, prevSummary, attention, freshness, dailyCalendar, units, prevUnits] = await Promise.all([
     computeFinanceSummary({ projectId, storeId, from, to }),
     computeFinanceSummary({ projectId, storeId, from: prevPeriod.from, to: prevPeriod.to }),
     computeAttention({ projectId, storeId, from, to }),
     getProjectDataFreshness(projectId, storeId),
     computeDailyCalendar({ projectId, storeId, from, to }),
+    computeOrderUnits({ projectId, storeId, from, to }),
+    computeOrderUnits({ projectId, storeId, from: prevPeriod.from, to: prevPeriod.to }),
   ]);
+  const statusMissing = units.orderedUnits > 0 && units.unitsWithStatus === 0;
+  const buyoutRate = units.orderedUnits > 0 ? units.deliveredUnits / units.orderedUnits : null;
 
   return (
     <div>
@@ -221,6 +226,47 @@ export default async function DashboardPage({
           <div className="kpi-value">{(summary.margin * 100).toFixed(1)}%</div>
           <div className="kpi-sub tooltip-hint" title="Прибыль, делённая на выручку">
             прибыль / выручка
+          </div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">
+            <span
+              className="tooltip-hint"
+              title="Сколько штук товара заказали покупатели за период (по дате оформления заказа), включая отменённые и ещё не доставленные. Стрелка — изменение к предыдущему периоду такой же длины."
+            >
+              Заказано, шт
+            </span>
+          </div>
+          <div className="kpi-value">{units.orderedUnits.toLocaleString('ru-RU')}</div>
+          <div className="kpi-sub">
+            {prevUnits.orderedUnits > 0 ? (
+              <>
+                <Trend curr={units.orderedUnits} prev={prevUnits.orderedUnits} higherIsGood /> к пред. периоду ({prevUnits.orderedUnits.toLocaleString('ru-RU')} шт)
+              </>
+            ) : (
+              'нет данных за пред. период'
+            )}
+          </div>
+        </div>
+        <div className="kpi-card">
+          <div className="kpi-label">
+            <span
+              className="tooltip-hint"
+              title="Сколько штук из заказанных за период уже доставлено покупателю (статус отправления Ozon «Доставлен»). Заказы последних дней обычно ещё в пути — поэтому к концу периода цифра растёт. % выкупа = выкуплено / заказано. Стрелка — изменение к предыдущему периоду такой же длины."
+            >
+              Выкуплено, шт
+            </span>
+          </div>
+          <div className="kpi-value">{statusMissing ? '—' : units.deliveredUnits.toLocaleString('ru-RU')}</div>
+          <div className="kpi-sub">
+            {statusMissing ? (
+              'нужна повторная синхронизация магазина'
+            ) : (
+              <>
+                выкуп {pct(buyoutRate)} <Trend curr={units.deliveredUnits} prev={prevUnits.unitsWithStatus > 0 ? prevUnits.deliveredUnits : null} higherIsGood />
+                {units.cancelledUnits > 0 && <> · отмен {units.cancelledUnits.toLocaleString('ru-RU')}</>}
+              </>
+            )}
           </div>
         </div>
       </div>

@@ -729,6 +729,7 @@ async function syncStoreAction(formData: FormData) {
       date: Date;
       accrualDate?: Date | null;
       externalId: string;
+      postingStatus?: string | null;
     }[] = [];
 
     // Дата начисления Ozon по отправлению — берём из финансовых операций (op.operation_date —
@@ -792,6 +793,7 @@ async function syncStoreAction(formData: FormData) {
         date,
         accrualDate,
         externalId: `${line.postingNumber}:${lineKey ?? 'x'}:revenue`,
+        postingStatus: line.status ?? null,
       });
 
       const costPrice = productId ? productCostPriceById.get(productId) : undefined;
@@ -957,7 +959,7 @@ async function syncStoreAction(formData: FormData) {
     if (lineRows.length > 0) {
       const existing = await prisma.financeTransaction.findMany({
         where: { storeId: store.id, externalId: { in: lineRows.map((r) => r.externalId) } },
-        select: { id: true, externalId: true, quantity: true, productId: true, accrualDate: true },
+        select: { id: true, externalId: true, quantity: true, productId: true, accrualDate: true, postingStatus: true },
       });
       const existingByExternalId = new Map(existing.map((e) => [e.externalId as string, e]));
       for (const r of lineRows) {
@@ -966,10 +968,13 @@ async function syncStoreAction(formData: FormData) {
           newLineRows.push(r);
           continue;
         }
-        const patch: { quantity?: number; productId?: string; accrualDate?: Date } = {};
+        const patch: { quantity?: number; productId?: string; accrualDate?: Date; postingStatus?: string } = {};
         if (match.quantity == null && r.quantity != null) patch.quantity = r.quantity;
         if (match.productId == null && r.productId != null) patch.productId = r.productId;
         if (match.accrualDate == null && r.accrualDate != null) patch.accrualDate = r.accrualDate;
+        // Статус заказа, в отличие от полей выше, меняется со временем (в пути → доставлен/отменён) —
+        // обновляем всегда, когда Ozon прислал другой.
+        if (r.postingStatus && match.postingStatus !== r.postingStatus) patch.postingStatus = r.postingStatus;
         if (Object.keys(patch).length > 0) {
           await prisma.financeTransaction.update({ where: { id: match.id }, data: patch });
           if (patch.quantity !== undefined) backfilledQty += 1;

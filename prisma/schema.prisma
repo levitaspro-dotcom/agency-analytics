@@ -240,6 +240,11 @@ model FinanceTransaction {
   accrualDate DateTime?
   description String?
   externalId  String?
+  /// Статус отправления Ozon (posting.status из /v3/posting/fbs/list · /v2/posting/fbo/list) —
+  /// только у REVENUE-строк из состава заказа. «delivered» = товар выкуплен покупателем,
+  /// «cancelled» = отменён; остальные — ещё в пути/сборке. Обновляется на каждой синхронизации
+  /// (статус заказа меняется со временем). null — строка синхронизирована до появления поля.
+  postingStatus String?
   createdAt   DateTime         @default(now())
 
   @@index([projectId, date])
