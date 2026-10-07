@@ -23,25 +23,44 @@ interface OzonFetchResult {
   json: any;
 }
 
+/**
+ * Ozon ограничивает частоту запросов (429 Too Many Requests) — особенно на финансовых методах,
+ * которые синхронизация вызывает пачкой (accrual/by-day — по запросу на каждый день периода).
+ * Раньше один 429 обрывал загрузку операций целиком: синхронизация AVON&Trend/ИННОВИО падала с
+ * «Ozon временно ограничил число запросов», и в приложении оставались неполные расходы/реклама.
+ * Теперь 429 и временные 5xx повторяем с паузой (Retry-After, иначе 1 → 2 → 4 → 8 → 8 с).
+ */
+const OZON_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 8000];
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function ozonFetch(creds: OzonCredentials, path: string, body: unknown): Promise<OzonFetchResult> {
-  const res = await fetch(`${OZON_API_BASE}${path}`, {
-    method: 'POST',
-    headers: {
-      'Client-Id': creds.clientId,
-      'Api-Key': creds.apiKey,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body ?? {}),
-    cache: 'no-store',
-  });
-  const text = await res.text();
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(`${OZON_API_BASE}${path}`, {
+      method: 'POST',
+      headers: {
+        'Client-Id': creds.clientId,
+        'Api-Key': creds.apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body ?? {}),
+      cache: 'no-store',
+    });
+    const retriable = res.status === 429 || res.status === 502 || res.status === 503 || res.status === 504;
+    if (retriable && attempt < OZON_RETRY_DELAYS_MS.length) {
+      const retryAfterSec = Number(res.headers.get('retry-after'));
+      const delay = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? Math.min(retryAfterSec * 1000, 15000) : OZON_RETRY_DELAYS_MS[attempt];
+      await sleep(delay);
+      continue;
+    }
+    const text = await res.text();
+    let json: any = null;
+    try {
+      json = text ? JSON.parse(text) : null;
+    } catch {
+      json = null;
+    }
+    return { ok: res.ok, status: res.status, json };
   }
-  return { ok: res.ok, status: res.status, json };
 }
 
 function ozonErrorMessage(status: number, json: any): string {
