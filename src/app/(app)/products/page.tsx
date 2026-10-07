@@ -31,7 +31,8 @@ export default async function ProductsPage({
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
   const canEdit = isManagerOrAbove(user.role);
-  const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
+  // По умолчанию — по дате начисления, как «Экономика магазина» в кабинете Ozon.
+  const dateBasis: DateBasis = searchParams.dateBasis === 'order' ? 'order' : 'accrual';
 
   const SORT_VALUES = ['true_margin_asc', 'true_margin_desc'] as const;
   const q = (searchParams.q || '').trim();

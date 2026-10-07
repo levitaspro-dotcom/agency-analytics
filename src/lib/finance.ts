@@ -54,8 +54,31 @@ export type DateBasis = 'order' | 'accrual';
  */
 export function dateWhere(basis: DateBasis, from: Date, to: Date) {
   if (basis === 'order') return { date: { gte: from, lte: to } };
-  return { accrualDate: { gte: from, lte: to } };
+  return {
+    accrualDate: { gte: from, lte: to },
+    // Продажей (выручка + себестоимость проданного) по дате начисления считаем только ВЫКУПЛЕННЫЕ
+    // отправления (статус Ozon «delivered»). У отменённых и невыкупленных заказов тоже бывают
+    // начисления (обратная логистика, обработка возврата) — поэтому дата начисления у их строк
+    // заполнена, и раньше они попадали в выручку, хотя продажи не было. Сверено с «Экономикой
+    // магазина» в кабинете Ozon (AVON&Trend, сентябрь 2026): невыкупленный заказ 15156597-0481-1
+    // давал лишние 2 000 ₽ выручки и 1 шт. Сборы (OZON_FEE) по таким заказам остаются — Ozon их
+    // реально удержал. Строки без статуса (синхронизированы до появления поля) не отбрасываем,
+    // чтобы до пересинхронизации выручка не обнулилась.
+    AND: [
+      {
+        OR: [
+          { category: { notIn: SALE_LINE_CATEGORIES } },
+          { postingStatus: null },
+          { postingStatus: 'delivered' },
+        ],
+      },
+    ],
+  };
 }
+
+/** Категории строк, созданных из состава заказа (выручка и себестоимость проданного) — в отличие
+ *  от строк-начислений Ozon. См. lineRows в syncStoreAction (projects/page.tsx). */
+const SALE_LINE_CATEGORIES = ['Продажи Ozon', 'Себестоимость проданных товаров'];
 
 function sumByCategory(rows: { category: string; amount: number }[]): CategoryBreakdown {
   const map = new Map<string, number>();
@@ -87,7 +110,7 @@ export async function computeFinanceSummary(params: {
         ...(storeId ? { storeId } : {}),
         ...dateWhere(dateBasis, from, to),
       },
-      select: { type: true, category: true, amount: true },
+      select: { type: true, category: true, amount: true, quantity: true, product: { select: { costPrice: true } } },
     }),
     prisma.project.findUnique({ where: { id: projectId }, select: { taxRatePercent: true } }),
   ]);
@@ -99,7 +122,20 @@ export async function computeFinanceSummary(params: {
     EXTERNAL_EXPENSE: [],
     TAX: [],
   };
-  for (const r of rows) byTypeRaw[r.type].push({ category: r.category, amount: r.amount });
+  // Себестоимость проданного — живым расчётом: проданные штуки (строки выручки из состава заказа,
+  // уже отфильтрованные dateWhere — по дате начисления только выкупленные) × ТЕКУЩАЯ себестоимость
+  // товара. Так же считает страница «Товары» (см. computeProductInsights). Сохранённые COGS-строки
+  // создаются только на синхронизации и только если себестоимость уже была введена — по ним
+  // «Обзор» расходился с «Товарами» и считал себестоимость и для отменённых заказов.
+  let liveCogs = 0;
+  for (const r of rows) {
+    if (r.type === 'COGS' && r.category === 'Себестоимость проданных товаров') continue;
+    byTypeRaw[r.type].push({ category: r.category, amount: r.amount });
+    if (r.type === 'REVENUE' && r.category === 'Продажи Ozon' && r.quantity && r.product && r.product.costPrice > 0) {
+      liveCogs += r.quantity * r.product.costPrice;
+    }
+  }
+  if (liveCogs > 0) byTypeRaw.COGS.push({ category: 'Себестоимость проданных товаров', amount: liveCogs });
 
   const revenue = byTypeRaw.REVENUE.reduce((s, r) => s + r.amount, 0);
   const ozonFees = byTypeRaw.OZON_FEE.reduce((s, r) => s + r.amount, 0);
@@ -523,7 +559,9 @@ export async function computeProductInsights(params: {
 // она ляжет в «Прочие сборы» ниже и будет видно, что появилось что-то новое, требующее разбора.
 const FINE_BUCKET_BY_CATEGORY: Record<string, string> = {
   'Комиссия за продажу': 'commission',
-  'Комиссия за бренд': 'commission',
+  // Ozon в «Экономике магазина» относит это начисление (brand_promotion, привязано к отправлению)
+  // к «Продвижение и реклама», а не к вознаграждению Ozon — сверено по сентябрю 2026.
+  'Комиссия за бренд': 'brandPromo',
   'Вознаграждение за продажу': 'commission',
   Логистика: 'logistics',
   'Курьерская доставка (последняя миля)': 'logistics',
@@ -763,7 +801,9 @@ export interface OrderUnitsSummary {
   /** Заказано, шт — сумма quantity по всем строкам состава заказа (REVENUE с quantity) с датой
    *  оформления в периоде, включая отменённые и ещё не доставленные — как «Заказано» в кабинете Ozon. */
   orderedUnits: number;
-  /** Выкуплено, шт — из тех же заказов периода только те, чьё отправление в статусе «delivered». */
+  /** Выкуплено, шт — доставленные покупателю штуки с ДАТОЙ НАЧИСЛЕНИЯ Ozon в периоде (момент
+   *  продажи), как «Продажи» в «Экономике магазина» Ozon. Не из заказов этого же периода: заказ
+   *  конца августа, выкупленный в сентябре, — продажа сентября. */
   deliveredUnits: number;
   /** Отменено, шт — статус «cancelled». */
   cancelledUnits: number;
@@ -779,22 +819,22 @@ export async function computeOrderUnits(params: {
   to: Date;
 }): Promise<OrderUnitsSummary> {
   const { projectId, storeId, from, to } = params;
-  const rows = await prisma.financeTransaction.findMany({
-    where: {
-      projectId,
-      ...(storeId ? { storeId } : {}),
-      type: 'REVENUE',
-      quantity: { not: null },
-      date: { gte: from, lte: to },
-    },
-    select: { quantity: true, postingStatus: true },
-  });
-  const res: OrderUnitsSummary = { orderedUnits: 0, deliveredUnits: 0, cancelledUnits: 0, unitsWithStatus: 0 };
+  const saleLine = { projectId, ...(storeId ? { storeId } : {}), type: 'REVENUE' as const, category: 'Продажи Ozon', quantity: { not: null } };
+  const [rows, delivered] = await Promise.all([
+    prisma.financeTransaction.findMany({
+      where: { ...saleLine, date: { gte: from, lte: to } },
+      select: { quantity: true, postingStatus: true },
+    }),
+    prisma.financeTransaction.aggregate({
+      where: { ...saleLine, postingStatus: 'delivered', accrualDate: { gte: from, lte: to } },
+      _sum: { quantity: true },
+    }),
+  ]);
+  const res: OrderUnitsSummary = { orderedUnits: 0, deliveredUnits: delivered._sum.quantity ?? 0, cancelledUnits: 0, unitsWithStatus: 0 };
   for (const r of rows) {
     const q = r.quantity ?? 0;
     res.orderedUnits += q;
     if (r.postingStatus) res.unitsWithStatus += q;
-    if (r.postingStatus === 'delivered') res.deliveredUnits += q;
     if (r.postingStatus === 'cancelled') res.cancelledUnits += q;
   }
   return res;

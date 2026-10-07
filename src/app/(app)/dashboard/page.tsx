@@ -7,6 +7,7 @@ import {
   computeDailyCalendar,
   computeOrderUnits,
   type CategoryBreakdown,
+  type DateBasis,
   type DailyCalendarEntry,
 } from '@/lib/finance';
 import { getProjectDataFreshness } from '@/lib/freshness';
@@ -142,7 +143,7 @@ function CategoryTable({ rows }: { rows: CategoryBreakdown }) {
 export default async function DashboardPage({
   searchParams,
 }: {
-  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string };
+  searchParams: { projectId?: string; storeId?: string; from?: string; to?: string; dateBasis?: string };
 }) {
   const user = await requireUser();
   const projects = await listAccessibleProjects(user);
@@ -163,10 +164,13 @@ export default async function DashboardPage({
   const storeId = searchParams.storeId || undefined;
   const { from, to } = resolvePeriod(searchParams);
   const prevPeriod = previousPeriod(from, to);
+  // По умолчанию — по дате начисления Ozon, как «Финансы → Экономика магазина» в кабинете:
+  // выручка = выкупленные отправления, сборы и реклама = начисления за период.
+  const dateBasis: DateBasis = searchParams.dateBasis === 'order' ? 'order' : 'accrual';
 
   const [summary, prevSummary, attention, freshness, dailyCalendar, units, prevUnits] = await Promise.all([
-    computeFinanceSummary({ projectId, storeId, from, to }),
-    computeFinanceSummary({ projectId, storeId, from: prevPeriod.from, to: prevPeriod.to }),
+    computeFinanceSummary({ projectId, storeId, from, to, dateBasis }),
+    computeFinanceSummary({ projectId, storeId, from: prevPeriod.from, to: prevPeriod.to, dateBasis }),
     computeAttention({ projectId, storeId, from, to }),
     getProjectDataFreshness(projectId, storeId),
     computeDailyCalendar({ projectId, storeId, from, to }),
@@ -178,16 +182,27 @@ export default async function DashboardPage({
 
   return (
     <div>
-      <FilterBar basePath="/dashboard" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} />
+      <FilterBar basePath="/dashboard" projects={projects} selectedProjectId={projectId} selectedStoreId={storeId} from={from} to={to} dateBasis={dateBasis} />
 
       <FreshnessBanner dataAsOf={freshness.dataAsOf} isStale={freshness.isStale} />
 
       <div className="kpi-grid">
         <div className="kpi-card">
-          <div className="kpi-label">Выручка</div>
+          <div className="kpi-label">
+            <span
+              className="tooltip-hint"
+              title={
+                dateBasis === 'accrual'
+                  ? 'Продажи за период по дате начисления Ozon — только выкупленные покупателем заказы. Совпадает с «Продажи и возвраты» в «Финансы → Экономика магазина» кабинета Ozon (там эта же сумма разбита на «Выручка» + «Баллы за скидки» + «Программы партнёров»).'
+                  : 'Сумма всех заказов, оформленных в период (по дате заказа), включая отменённые и ещё не доставленные.'
+              }
+            >
+              {dateBasis === 'accrual' ? 'Выручка (продажи)' : 'Сумма заказов'}
+            </span>
+          </div>
           <div className="kpi-value">{money(summary.revenue)}</div>
           <div className="kpi-sub">
-            {formatDate(from)} – {formatDate(to)}
+            {formatDate(from)} – {formatDate(to)} · {dateBasis === 'accrual' ? 'по дате начисления Ozon' : 'по дате заказа'}
           </div>
         </div>
         <div className="kpi-card">
@@ -252,7 +267,7 @@ export default async function DashboardPage({
           <div className="kpi-label">
             <span
               className="tooltip-hint"
-              title="Сколько штук из заказанных за период уже доставлено покупателю (статус отправления Ozon «Доставлен»). Заказы последних дней обычно ещё в пути — поэтому к концу периода цифра растёт. % выкупа = выкуплено / заказано. Стрелка — изменение к предыдущему периоду такой же длины."
+              title="Сколько штук выкуплено покупателями за период — по дате начисления Ozon (момент продажи), как «Продажи» в «Экономике магазина» Ozon. Отмены и невыкупы сюда не входят. % выкупа = выкуплено / заказано за тот же период (приблизительно: часть выкупов периода — это заказы предыдущего). Стрелка — изменение к предыдущему периоду такой же длины."
             >
               Выкуплено, шт
             </span>

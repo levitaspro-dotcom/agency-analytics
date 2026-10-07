@@ -63,7 +63,8 @@ export default async function ExpensesPage({
   // «Отчётом по начислениям» Ozon (который сам считает по дате начисления) не сходилось: разное
   // количество заказов в периоде, а не ошибка в деньгах. Ольга поймала это на Артемизин-М —
   // «Продано» здесь показывало 1 шт (по дате заказа), а в её отчёте 3 шт (по дате начисления).
-  const dateBasis: DateBasis = searchParams.dateBasis === 'accrual' ? 'accrual' : 'order';
+  // По умолчанию — по дате начисления, как «Экономика магазина» в кабинете Ozon.
+  const dateBasis: DateBasis = searchParams.dateBasis === 'order' ? 'order' : 'accrual';
 
   // computeFinanceSummary — тот же расчёт, что и на «Обзоре»/«Отчётах»: суммы по категориям здесь
   // уже переведены на русский (см. translateCategory в lib/finance.ts) и, важно, здесь ЕСТЬ налог —

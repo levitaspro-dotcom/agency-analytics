@@ -808,6 +808,7 @@ async function syncStoreAction(formData: FormData) {
           date,
           accrualDate,
           externalId: `${line.postingNumber}:${lineKey ?? 'x'}:cogs`,
+          postingStatus: line.status ?? null,
         });
       }
     }
